@@ -1,6 +1,4 @@
 git+https://github.com/microsoft/MoGe.git
-natten
 diffusers
 accelerate
 plyfile
-https://github.com/LDYang694/Storages/releases/download/20260430/utils3d-0.0.2-py3-none-any.whl

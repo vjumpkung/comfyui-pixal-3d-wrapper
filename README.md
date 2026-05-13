@@ -9,7 +9,7 @@ loader does not require a separate `~/Documents/Pixal3D` path.
 - **Pixal3D Model Loader**: loads Pixal3D, MoGe, and DINO/NAF conditioning models.
 - **Pixal3D Sampler Settings**: optional advanced sampler controls matching the upstream Pixal3D inference defaults.
 - **Pixal3D Preprocess Image**: runs Pixal3D background removal/crop preprocessing and returns an `IMAGE`.
-- **Pixal3D Image to GLB**: output node that generates a GLB, returns the GLB path, the preprocessed image, and camera metadata JSON.
+- **Pixal3D Image to GLB**: output node that generates a GLB, returns the GLB path, a `FILE_3D_GLB` mesh output for ComfyUI's 3D viewer, the preprocessed image, and camera metadata JSON.
 
 ## Setup
 
@@ -18,6 +18,11 @@ loader does not require a separate `~/Documents/Pixal3D` path.
 
 Pixal3D inference requires CUDA. The loader defaults to `device=cuda` and keeps
 models cached after the first load.
+
+On Windows, if NAF fails with `NATTEN was not built with libnatten`, keep the
+loader's `naf_attention_backend` at `auto` or select `torch`. The `torch`
+fallback is slower, but supports NAF's mismatched QK/V head dimensions when
+NATTEN Flex cannot.
 
 Pixal3D also requires the upstream `utils3d` wheel:
 
@@ -35,6 +40,9 @@ before starting ComfyUI.
 2. Connect its output to **Pixal3D Image to GLB**.
 3. Connect a ComfyUI `IMAGE` to **Pixal3D Image to GLB**.
 4. Queue the graph.
+
+The `mesh` output from **Pixal3D Image to GLB** can be connected directly to
+ComfyUI's built-in **Preview 3D & Animation** node.
 
 Generated files are written to `ComfyUI/output/pixal3d/*.glb`.
 

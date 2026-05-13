@@ -16,8 +16,9 @@ stack installed in the same Python environment that runs ComfyUI.
 
 - `__init__.py`: exports ComfyUI node mappings.
 - `nodes.py`: defines the ComfyUI nodes and UI-facing input/output contracts.
-- `pixal3d_runtime.py`: lazy model loading, model cache, image conversion,
-  camera estimation, Pixal3D pipeline execution, and GLB export.
+- `pixal3d_runtime.py`: lazy model loading, model cache, Hugging Face
+  cache-first model resolution, NAF attention backend patching, image
+  conversion, camera estimation, Pixal3D pipeline execution, and GLB export.
 - `vendor/Pixal3D`: bundled upstream Pixal3D inference source, requirements,
   and license.
 - `requirements.txt`: helper dependency list for Pixal3D-side dependencies.
@@ -32,7 +33,8 @@ stack installed in the same Python environment that runs ComfyUI.
   `IMAGE`.
 - `Pixal3D Image to GLB`: output node that writes
   `ComfyUI/output/pixal3d/*.glb` and returns the GLB path, preprocessed image,
-  and camera metadata JSON.
+  camera metadata JSON, and a `FILE_3D_GLB` mesh output for ComfyUI preview
+  nodes.
 
 ## Runtime Notes
 
@@ -45,10 +47,19 @@ stack installed in the same Python environment that runs ComfyUI.
   - `model_path`: `TencentARC/Pixal3D`
   - `moge_model_name`: `Ruicheng/moge-2-vitl`
   - `device`: `cuda`
+  - `naf_attention_backend`: `auto`
 - To test an external Pixal3D checkout, set `PIXAL3D_ROOT` before starting
   ComfyUI. Do not re-add a normal loader widget for this unless the user asks.
+- Hugging Face repo IDs should be resolved to local snapshots before upstream
+  `from_pretrained` calls. Check the local cache first, including symlinked
+  snapshot files; download only on cache miss or incomplete snapshot.
 - `low_vram=True` keeps Pixal3D behavior conservative and moves conditioning
   models on demand.
+- NAF attention backends are `auto`, `torch`, `flex-fna`, `cutlass-fna`,
+  `hopper-fna`, and `blackwell-fna`. On Windows, NATTEN often lacks libnatten,
+  so `auto` may need the wrapper-side `torch` fallback for NAF's mismatched QK/V
+  head dimensions. The `torch` fallback is slower but avoids unsupported
+  NATTEN backends.
 - Full generation is serialized with the cached context lock to avoid concurrent
   mutation of shared model state.
 - If an image has already gone through `Pixal3D Preprocess Image`, set
@@ -72,6 +83,9 @@ stack installed in the same Python environment that runs ComfyUI.
 - Keep vendored Pixal3D code under `vendor/Pixal3D`. Avoid editing vendored files
   unless a compatibility patch is needed; prefer wrapper-side changes in
   `pixal3d_runtime.py`.
+- Existing vendored compatibility patches support DINOv3 transformer layer
+  layouts from both older and newer `transformers` versions. Preserve that
+  compatibility if touching DINOv3 feature extraction.
 - Do not run full Pixal3D inference unless the active environment has CUDA and
   the Pixal3D dependency stack installed.
 

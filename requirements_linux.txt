@@ -1,0 +1,6 @@
+https://github.com/visualbruno/ComfyUI-Trellis2/raw/refs/heads/main/wheels/Linux/Torch291/cumesh-1.0-cp312-cp312-linux_x86_64.whl
+https://github.com/visualbruno/ComfyUI-Trellis2/raw/refs/heads/main/wheels/Linux/Torch291/custom_rasterizer-0.1-cp312-cp312-linux_x86_64.whl
+https://github.com/visualbruno/ComfyUI-Trellis2/raw/refs/heads/main/wheels/Linux/Torch291/flex_gemm-0.0.1-cp312-cp312-linux_x86_64.whl
+https://github.com/visualbruno/ComfyUI-Trellis2/raw/refs/heads/main/wheels/Linux/Torch291/nvdiffrast-0.4.0-cp312-cp312-linux_x86_64.whl
+https://github.com/visualbruno/ComfyUI-Trellis2/raw/refs/heads/main/wheels/Linux/Torch291/nvdiffrec_render-0.0.0-cp312-cp312-linux_x86_64.whl
+https://github.com/visualbruno/ComfyUI-Trellis2/raw/refs/heads/main/wheels/Linux/Torch291/o_voxel-0.0.1-cp312-cp312-linux_x86_64.whl

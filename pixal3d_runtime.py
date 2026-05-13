@@ -4,6 +4,7 @@ import re
 import sys
 import threading
 import time
+import types
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
@@ -18,6 +19,14 @@ BUNDLED_PIXAL3D_ROOT = PACKAGE_ROOT / "vendor" / "Pixal3D"
 DEFAULT_MODEL_PATH = "TencentARC/Pixal3D"
 DEFAULT_MOGE_MODEL = "Ruicheng/moge-2-vitl"
 MAX_SEED = np.iinfo(np.int32).max
+NAF_ATTENTION_BACKENDS = (
+    "auto",
+    "torch",
+    "flex-fna",
+    "cutlass-fna",
+    "hopper-fna",
+    "blackwell-fna",
+)
 
 IMAGE_COND_CONFIGS: Dict[str, Dict[str, Any]] = {
     "ss": {
@@ -56,6 +65,7 @@ class Pixal3DContext:
     moge_model_name: str
     device: str
     low_vram: bool
+    naf_attention_backend: str
     pipeline: Any
     moge_model: Any
     lock: threading.Lock
@@ -69,8 +79,127 @@ class Pixal3DResult:
     resolution: int
 
 
-_MODEL_CACHE: Dict[Tuple[str, str, str, str, bool], Pixal3DContext] = {}
+_MODEL_CACHE: Dict[Tuple[str, str, str, str, bool, str], Pixal3DContext] = {}
 _MODEL_CACHE_LOCK = threading.Lock()
+_HF_SNAPSHOT_CACHE: Dict[Tuple[str, Tuple[str, ...]], str] = {}
+_HF_SNAPSHOT_CACHE_LOCK = threading.Lock()
+
+
+def _path_exists(path: str) -> bool:
+    return Path(os.path.expanduser(path)).exists()
+
+
+def _looks_like_hf_repo_id(value: str) -> bool:
+    model_id = value.strip()
+    if not model_id or "\\" in model_id or ":" in model_id or _path_exists(model_id):
+        return False
+    return bool(re.fullmatch(r"[\w.-]+/[\w.-]+", model_id))
+
+
+def _snapshot_has_files(snapshot_dir: str, filenames: Tuple[str, ...]) -> bool:
+    root = Path(snapshot_dir)
+    return all((root / filename).is_file() for filename in filenames)
+
+
+def _cached_snapshot_from_file(repo_id: str, filename: str) -> Optional[str]:
+    try:
+        from huggingface_hub import try_to_load_from_cache
+    except ImportError as exc:
+        raise RuntimeError(
+            "huggingface_hub is required to load Pixal3D model repositories."
+        ) from exc
+
+    cached = try_to_load_from_cache(repo_id, filename)
+    if not isinstance(cached, str):
+        return None
+
+    file_path = Path(cached)
+    if not file_path.is_file():
+        return None
+
+    filename_depth = len(Path(filename).parts)
+    return str(file_path.parents[filename_depth - 1])
+
+
+def _resolve_hf_snapshot(
+    repo_id: str,
+    required_files: Tuple[str, ...] = (),
+) -> str:
+    model_id = repo_id.strip()
+    if not _looks_like_hf_repo_id(model_id):
+        if _path_exists(model_id):
+            return os.path.abspath(os.path.expanduser(model_id))
+        return model_id
+
+    cache_key = (model_id, tuple(sorted(required_files)))
+    with _HF_SNAPSHOT_CACHE_LOCK:
+        cached = _HF_SNAPSHOT_CACHE.get(cache_key)
+        if cached and _snapshot_has_files(cached, required_files):
+            return cached
+
+        snapshot_dir = None
+        if required_files:
+            snapshot_dir = _cached_snapshot_from_file(model_id, required_files[0])
+            if snapshot_dir and not _snapshot_has_files(snapshot_dir, required_files):
+                snapshot_dir = None
+        else:
+            try:
+                from huggingface_hub import snapshot_download
+
+                snapshot_dir = snapshot_download(model_id, local_files_only=True)
+            except Exception:
+                snapshot_dir = None
+
+        if snapshot_dir is None:
+            from huggingface_hub import snapshot_download
+
+            snapshot_dir = snapshot_download(model_id)
+
+        if required_files and not _snapshot_has_files(snapshot_dir, required_files):
+            missing = [
+                filename
+                for filename in required_files
+                if not (Path(snapshot_dir) / filename).is_file()
+            ]
+            raise RuntimeError(
+                f"Hugging Face cache for {model_id} is missing required file(s): "
+                f"{', '.join(missing)}"
+            )
+
+        _HF_SNAPSHOT_CACHE[cache_key] = snapshot_dir
+        return snapshot_dir
+
+
+def _pixal3d_required_files(snapshot_dir: str) -> Tuple[str, ...]:
+    pipeline_config = Path(snapshot_dir) / "pipeline.json"
+    if not pipeline_config.is_file():
+        return ("pipeline.json",)
+
+    with pipeline_config.open("r", encoding="utf-8") as f:
+        args = json.load(f).get("args", {})
+
+    required = ["pipeline.json"]
+    for model_name in args.get("models", {}).values():
+        model_stem = str(model_name).strip().strip("/")
+        if not model_stem:
+            continue
+        required.append(f"{model_stem}.json")
+        required.append(f"{model_stem}.safetensors")
+    return tuple(required)
+
+
+def _resolve_pixal3d_model_path(model_path: str) -> str:
+    source = model_path.strip()
+    if not _looks_like_hf_repo_id(source):
+        if _path_exists(source):
+            return os.path.abspath(os.path.expanduser(source))
+        return source
+
+    snapshot_dir = _resolve_hf_snapshot(source, ("pipeline.json",))
+    required_files = _pixal3d_required_files(snapshot_dir)
+    if not _snapshot_has_files(snapshot_dir, required_files):
+        snapshot_dir = _resolve_hf_snapshot(source, required_files)
+    return snapshot_dir
 
 
 def resolve_pixal3d_root(pixal3d_root: Optional[str] = None) -> str:
@@ -98,14 +227,275 @@ def require_cuda_device(device: str) -> None:
         raise RuntimeError("Pixal3D inference requires CUDA, but torch.cuda is not available.")
 
 
-def build_image_cond_model(config: Dict[str, Any]) -> Any:
+def normalize_naf_attention_backend(value: Optional[str]) -> str:
+    backend = (value or os.environ.get("PIXAL3D_NAF_ATTENTION_BACKEND") or "auto").strip()
+    if backend not in NAF_ATTENTION_BACKENDS:
+        choices = ", ".join(NAF_ATTENTION_BACKENDS)
+        raise ValueError(f"Invalid NAF attention backend '{backend}'. Expected one of: {choices}.")
+    return backend
+
+
+def _pair(value: Any) -> Tuple[int, int]:
+    if isinstance(value, tuple):
+        return int(value[0]), int(value[1])
+    if isinstance(value, list):
+        return int(value[0]), int(value[1])
+    return int(value), int(value)
+
+
+def _torch_neighborhood_attention_2d(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    kernel_size: Any,
+    dilation: Any,
+    scale: float,
+) -> torch.Tensor:
+    b, h, w, heads, qk_dim = q.shape
+    value_dim = v.shape[-1]
+    kernel_h, kernel_w = _pair(kernel_size)
+    dilation_h, dilation_w = _pair(dilation)
+    center_h = kernel_h // 2
+    center_w = kernel_w // 2
+    chunk_rows = int(os.environ.get("PIXAL3D_NAF_TORCH_CHUNK_ROWS", "16"))
+    chunk_rows = max(1, min(chunk_rows, h))
+
+    def offset_slice(
+        x: torch.Tensor,
+        row_start: int,
+        row_end: int,
+        rel_h: int,
+        rel_w: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        rows = row_end - row_start
+        out = torch.zeros(
+            b,
+            rows,
+            w,
+            heads,
+            x.shape[-1],
+            device=x.device,
+            dtype=x.dtype,
+        )
+        valid = torch.zeros(1, rows, w, 1, device=x.device, dtype=torch.bool)
+
+        q_row_start = max(row_start, -rel_h)
+        q_row_end = min(row_end, h - rel_h)
+        q_col_start = max(0, -rel_w)
+        q_col_end = min(w, w - rel_w)
+        if q_row_start >= q_row_end or q_col_start >= q_col_end:
+            return out, valid
+
+        dst_row_start = q_row_start - row_start
+        dst_row_end = q_row_end - row_start
+        src_row_start = q_row_start + rel_h
+        src_row_end = q_row_end + rel_h
+        src_col_start = q_col_start + rel_w
+        src_col_end = q_col_end + rel_w
+
+        out[:, dst_row_start:dst_row_end, q_col_start:q_col_end] = x[
+            :,
+            src_row_start:src_row_end,
+            src_col_start:src_col_end,
+        ]
+        valid[:, dst_row_start:dst_row_end, q_col_start:q_col_end] = True
+        return out, valid
+
+    outputs = []
+    for row_start in range(0, h, chunk_rows):
+        row_end = min(row_start + chunk_rows, h)
+        rows = row_end - row_start
+        q_chunk = q[:, row_start:row_end]
+
+        score_parts = []
+        offset_slices = []
+        for kh in range(kernel_h):
+            rel_h = (kh - center_h) * dilation_h
+            for kw in range(kernel_w):
+                rel_w = (kw - center_w) * dilation_w
+                k_slice, valid = offset_slice(k, row_start, row_end, rel_h, rel_w)
+                score = (q_chunk.float() * k_slice.float()).sum(dim=-1) * float(scale)
+                score = score.masked_fill(~valid, torch.finfo(score.dtype).min)
+                score_parts.append(score)
+                offset_slices.append((rel_h, rel_w))
+
+        weights = torch.softmax(torch.stack(score_parts, dim=-1), dim=-1).to(v.dtype)
+        chunk_out = torch.zeros(
+            b,
+            rows,
+            w,
+            heads,
+            value_dim,
+            device=v.device,
+            dtype=v.dtype,
+        )
+        for offset_index, (rel_h, rel_w) in enumerate(offset_slices):
+            v_slice, _valid = offset_slice(v, row_start, row_end, rel_h, rel_w)
+            chunk_out.add_(weights[..., offset_index].unsqueeze(-1) * v_slice)
+        outputs.append(chunk_out)
+
+    return torch.cat(outputs, dim=1)
+
+
+def _patch_naf_model_attention(naf_model: Any, naf_attention_backend: str) -> None:
+    upsampler = getattr(naf_model, "upsampler", None)
+    if upsampler is None:
+        return
+
+    backend = normalize_naf_attention_backend(naf_attention_backend)
+    upsampler._pixal3d_naf_attention_backend = backend
+    if getattr(upsampler, "_pixal3d_attention_patched", False):
+        return
+
+    original_forward = upsampler.forward
+
+    def forward_with_backend(self, q, k, v, image=None, return_weights=False, **kwargs):
+        attn_module = sys.modules.get(self.__class__.__module__)
+        natten_recent = getattr(attn_module, "NATTEN_RECENT", True)
+        legacy_attention = getattr(attn_module, "legacy_attention", None)
+
+        hq, wq = q.shape[-2:]
+        hk, wk = k.shape[-2:]
+        dilation = (hq // hk, wq // wk)
+        self.dilation = dilation
+
+        from einops import rearrange
+
+        q = rearrange(q, "b (n d) h w -> b h w n d", n=self.num_heads)
+        k = self._resize(k, size=(hq, wq), dtype=q.dtype)
+        v = self._resize(v, size=(hq, wq), dtype=q.dtype)
+
+        if return_weights:
+            if natten_recent or legacy_attention is None:
+                raise RuntimeError("NAF return_weights is not supported with this NATTEN version.")
+            out, attn_weights = legacy_attention(
+                q,
+                k,
+                v,
+                self.kernel_size,
+                dilation,
+                scale=self.scale,
+                return_weights=True,
+            )
+            return rearrange(out, "b h w n d -> b (n d) h w"), attn_weights
+
+        if not natten_recent and legacy_attention is not None:
+            out = legacy_attention(q, k, v, self.kernel_size, dilation, scale=self.scale)
+            return rearrange(out, "b h w n d -> b (n d) h w")
+
+        selected_backend = getattr(self, "_pixal3d_naf_attention_backend", "auto")
+        if selected_backend == "torch" or (
+            selected_backend in {"auto", "flex-fna"} and q.shape[-1] != v.shape[-1]
+        ):
+            out = _torch_neighborhood_attention_2d(
+                q,
+                k,
+                v,
+                kernel_size=self.kernel_size,
+                dilation=dilation,
+                scale=self.scale,
+            )
+            return rearrange(out, "b h w n d -> b (n d) h w")
+
+        try:
+            from natten import na2d
+        except ImportError:
+            from natten.functional import na2d
+
+        if selected_backend == "auto":
+            selected_backend = None
+        try:
+            out = na2d(
+                q,
+                k,
+                v,
+                kernel_size=self.kernel_size,
+                dilation=dilation,
+                stride=1,
+                backend=selected_backend,
+            )
+        except (RuntimeError, ValueError) as exc:
+            if q.shape[-1] == v.shape[-1]:
+                raise
+            message = str(exc)
+            if "different head dims" not in message and "head dim" not in message:
+                raise
+            out = _torch_neighborhood_attention_2d(
+                q,
+                k,
+                v,
+                kernel_size=self.kernel_size,
+                dilation=dilation,
+                scale=self.scale,
+            )
+        return rearrange(out, "b h w n d -> b (n d) h w")
+
+    upsampler._pixal3d_original_forward = original_forward
+    upsampler.forward = types.MethodType(forward_with_backend, upsampler)
+    upsampler._pixal3d_attention_patched = True
+
+
+def _configure_image_cond_naf_attention(model: Any, naf_attention_backend: str) -> None:
+    backend = normalize_naf_attention_backend(naf_attention_backend)
+    model._pixal3d_naf_attention_backend = backend
+
+    if getattr(model, "_pixal3d_load_naf_patched", False):
+        if getattr(model, "naf_model", None) is not None:
+            _patch_naf_model_attention(model.naf_model, backend)
+        return
+
+    original_load_naf = model._load_naf
+
+    def load_naf_with_backend(*args, **kwargs):
+        result = original_load_naf(*args, **kwargs)
+        if getattr(model, "naf_model", None) is not None:
+            _patch_naf_model_attention(
+                model.naf_model,
+                getattr(model, "_pixal3d_naf_attention_backend", "auto"),
+            )
+        return result
+
+    model._pixal3d_original_load_naf = original_load_naf
+    model._load_naf = load_naf_with_backend
+    model._pixal3d_load_naf_patched = True
+    if getattr(model, "naf_model", None) is not None:
+        _patch_naf_model_attention(model.naf_model, backend)
+
+
+def build_image_cond_model(config: Dict[str, Any], naf_attention_backend: str) -> Any:
     from pixal3d.trainers.flow_matching.mixins.image_conditioned_proj import (
         DinoV3ProjFeatureExtractor,
     )
 
-    model = DinoV3ProjFeatureExtractor(**config)
+    resolved_config = dict(config)
+    model_name = resolved_config.get("model_name")
+    if isinstance(model_name, str):
+        resolved_config["model_name"] = _resolve_hf_snapshot(model_name)
+
+    model = DinoV3ProjFeatureExtractor(**resolved_config)
+    if getattr(model, "use_naf_upsample", False):
+        _configure_image_cond_naf_attention(model, naf_attention_backend)
     model.eval()
     return model
+
+
+def _patch_rembg_cache_resolution() -> None:
+    from pixal3d.pipelines import rembg
+
+    original = getattr(rembg, "BiRefNet", None)
+    if original is None or getattr(original, "_pixal3d_cache_wrapped", False):
+        return
+
+    class CachedBiRefNet(original):
+        _pixal3d_cache_wrapped = True
+
+        def __init__(self, model_name: str = "ZhengPeng7/BiRefNet"):
+            super().__init__(_resolve_hf_snapshot(model_name))
+
+    CachedBiRefNet.__name__ = original.__name__
+    CachedBiRefNet.__qualname__ = original.__qualname__
+    rembg.BiRefNet = CachedBiRefNet
 
 
 def _move_image_cond_models(pipeline: Any, device: str, low_vram: bool) -> None:
@@ -124,7 +514,12 @@ def _move_image_cond_models(pipeline: Any, device: str, low_vram: bool) -> None:
             model.to(torch.device(device))
 
 
-def _preload_naf_models(pipeline: Any, device: str, low_vram: bool) -> None:
+def _preload_naf_models(
+    pipeline: Any,
+    device: str,
+    low_vram: bool,
+    naf_attention_backend: str,
+) -> None:
     for attr in (
         "image_cond_model_ss",
         "image_cond_model_shape_512",
@@ -136,6 +531,7 @@ def _preload_naf_models(pipeline: Any, device: str, low_vram: bool) -> None:
             continue
         if low_vram:
             model.to(torch.device(device))
+        _configure_image_cond_naf_attention(model, naf_attention_backend)
         model._load_naf()
         if low_vram:
             model.cpu()
@@ -148,6 +544,7 @@ def load_pixal3d_context(
     device: str = "cuda",
     low_vram: bool = True,
     preload_naf: bool = True,
+    naf_attention_backend: str = "auto",
     force_reload: bool = False,
 ) -> Pixal3DContext:
     root = resolve_pixal3d_root(pixal3d_root)
@@ -159,7 +556,15 @@ def load_pixal3d_context(
         )
 
     require_cuda_device(device)
-    key = (root, model_path.strip(), moge_model_name.strip(), device.strip(), bool(low_vram))
+    naf_attention_backend = normalize_naf_attention_backend(naf_attention_backend)
+    key = (
+        root,
+        model_path.strip(),
+        moge_model_name.strip(),
+        device.strip(),
+        bool(low_vram),
+        naf_attention_backend,
+    )
 
     with _MODEL_CACHE_LOCK:
         if force_reload:
@@ -179,25 +584,40 @@ def load_pixal3d_context(
                 "dependencies in the same Python environment ComfyUI uses."
             ) from exc
 
-        pipeline = Pixal3DImageTo3DPipeline.from_pretrained(model_path.strip())
-        pipeline.image_cond_model_ss = build_image_cond_model(IMAGE_COND_CONFIGS["ss"])
+        _patch_rembg_cache_resolution()
+
+        resolved_model_path = _resolve_pixal3d_model_path(model_path.strip())
+        pipeline = Pixal3DImageTo3DPipeline.from_pretrained(resolved_model_path)
+        pipeline.image_cond_model_ss = build_image_cond_model(
+            IMAGE_COND_CONFIGS["ss"],
+            naf_attention_backend,
+        )
         pipeline.image_cond_model_shape_512 = build_image_cond_model(
-            IMAGE_COND_CONFIGS["shape_512"]
+            IMAGE_COND_CONFIGS["shape_512"],
+            naf_attention_backend,
         )
         pipeline.image_cond_model_shape_1024 = build_image_cond_model(
-            IMAGE_COND_CONFIGS["shape_1024"]
+            IMAGE_COND_CONFIGS["shape_1024"],
+            naf_attention_backend,
         )
         pipeline.image_cond_model_tex_1024 = build_image_cond_model(
-            IMAGE_COND_CONFIGS["tex_1024"]
+            IMAGE_COND_CONFIGS["tex_1024"],
+            naf_attention_backend,
         )
         pipeline.low_vram = bool(low_vram)
         pipeline.to(torch.device(device))
         _move_image_cond_models(pipeline, device, bool(low_vram))
 
         if preload_naf:
-            _preload_naf_models(pipeline, device, bool(low_vram))
+            _preload_naf_models(pipeline, device, bool(low_vram), naf_attention_backend)
 
-        moge_model = MoGeModel.from_pretrained(moge_model_name.strip()).to(device)
+        resolved_moge_model_name = _resolve_hf_snapshot(moge_model_name.strip())
+        try:
+            moge_model = MoGeModel.from_pretrained(resolved_moge_model_name).to(device)
+        except Exception:
+            if resolved_moge_model_name == moge_model_name.strip():
+                raise
+            moge_model = MoGeModel.from_pretrained(moge_model_name.strip()).to(device)
         moge_model.eval()
 
         context = Pixal3DContext(
@@ -206,6 +626,7 @@ def load_pixal3d_context(
             moge_model_name=moge_model_name.strip(),
             device=device.strip(),
             low_vram=bool(low_vram),
+            naf_attention_backend=naf_attention_backend,
             pipeline=pipeline,
             moge_model=moge_model,
             lock=threading.Lock(),

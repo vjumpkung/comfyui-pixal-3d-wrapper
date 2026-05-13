@@ -7,6 +7,7 @@ from .pixal3d_runtime import (
     DEFAULT_MODEL_PATH,
     DEFAULT_MOGE_MODEL,
     MAX_SEED,
+    NAF_ATTENTION_BACKENDS,
     camera_params_to_json,
     default_sampler_settings,
     image_tensor_to_pil,
@@ -46,6 +47,32 @@ def _progress_callback() -> Any:
     return update
 
 
+def _glb_file_output(glb_path: str) -> Any:
+    try:
+        from comfy_api.latest import Types
+    except Exception:
+        return glb_path
+    return Types.File3D(glb_path, "glb")
+
+
+def _glb_preview_item(glb_path: str) -> Dict[str, str]:
+    output_dir = os.path.abspath(_output_directory())
+    abs_path = os.path.abspath(glb_path)
+    try:
+        rel_path = os.path.relpath(abs_path, output_dir)
+    except ValueError:
+        rel_path = os.path.basename(abs_path)
+    if rel_path == ".." or rel_path.startswith(".." + os.sep):
+        rel_path = os.path.basename(abs_path)
+
+    subfolder = os.path.dirname(rel_path).replace("\\", "/")
+    return {
+        "filename": os.path.basename(rel_path),
+        "subfolder": subfolder,
+        "type": "output",
+    }
+
+
 class Pixal3DModelLoader:
     @classmethod
     def INPUT_TYPES(cls):
@@ -74,6 +101,10 @@ class Pixal3DModelLoader:
                 ),
                 "low_vram": ("BOOLEAN", {"default": True}),
                 "preload_naf": ("BOOLEAN", {"default": True}),
+                "naf_attention_backend": (
+                    list(NAF_ATTENTION_BACKENDS),
+                    {"default": "auto"},
+                ),
                 "force_reload": ("BOOLEAN", {"default": False}),
             }
         }
@@ -90,6 +121,7 @@ class Pixal3DModelLoader:
         device: str,
         low_vram: bool,
         preload_naf: bool,
+        naf_attention_backend: str,
         force_reload: bool,
     ):
         context = load_pixal3d_context(
@@ -98,6 +130,7 @@ class Pixal3DModelLoader:
             device=device,
             low_vram=low_vram,
             preload_naf=preload_naf,
+            naf_attention_backend=naf_attention_backend,
             force_reload=force_reload,
         )
         return (context,)
@@ -277,8 +310,8 @@ class Pixal3DImageToGLB:
             },
         }
 
-    RETURN_TYPES = ("STRING", "IMAGE", "STRING")
-    RETURN_NAMES = ("glb_path", "preprocessed_image", "camera_json")
+    RETURN_TYPES = ("STRING", "IMAGE", "STRING", "FILE_3D_GLB")
+    RETURN_NAMES = ("glb_path", "preprocessed_image", "camera_json", "mesh")
     FUNCTION = "generate"
     OUTPUT_NODE = True
     CATEGORY = "Pixal3D"
@@ -332,9 +365,13 @@ class Pixal3DImageToGLB:
         )
         camera_json = camera_params_to_json(result.camera_params, result.resolution)
         preprocessed_tensor = pil_to_image_tensor(result.preprocessed_image)
+        mesh = _glb_file_output(result.glb_path)
         return {
-            "ui": {"text": [result.glb_path, camera_json]},
-            "result": (result.glb_path, preprocessed_tensor, camera_json),
+            "ui": {
+                "3d": [_glb_preview_item(result.glb_path)],
+                "text": [result.glb_path, camera_json],
+            },
+            "result": (result.glb_path, preprocessed_tensor, camera_json, mesh),
         }
 
 
