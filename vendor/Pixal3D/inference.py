@@ -9,7 +9,25 @@ from PIL import Image
 
 os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-os.environ["ATTN_BACKEND"] = "flash_attn_3"
+attention_backend = (
+    os.environ.get("PIXAL3D_ATTENTION_BACKEND")
+    or os.environ.get("ATTN_BACKEND")
+    or "flash_attn_3"
+)
+os.environ["ATTN_BACKEND"] = attention_backend
+sparse_attention_backend = (
+    os.environ.get("PIXAL3D_SPARSE_ATTENTION_BACKEND")
+    or os.environ.get("SPARSE_ATTN_BACKEND")
+)
+if sparse_attention_backend is None and attention_backend in {
+    "xformers",
+    "flash_attn",
+    "flash_attn_3",
+    "flash_attn_4",
+}:
+    sparse_attention_backend = attention_backend
+if sparse_attention_backend is not None:
+    os.environ["SPARSE_ATTN_BACKEND"] = sparse_attention_backend
 os.environ["FLEX_GEMM_AUTOTUNE_CACHE_PATH"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'autotune_cache.json')
 os.environ["FLEX_GEMM_AUTOTUNER_VERBOSE"] = '1'
 

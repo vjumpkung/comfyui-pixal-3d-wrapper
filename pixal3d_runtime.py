@@ -3,9 +3,9 @@ import os
 import re
 import sys
 import threading
-import time
 import types
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 
@@ -18,7 +18,25 @@ PACKAGE_ROOT = Path(__file__).resolve().parent
 BUNDLED_PIXAL3D_ROOT = PACKAGE_ROOT / "vendor" / "Pixal3D"
 DEFAULT_MODEL_PATH = "TencentARC/Pixal3D"
 DEFAULT_MOGE_MODEL = "Ruicheng/moge-2-vitl"
+DEFAULT_REMBG_MODEL = "ZhengPeng7/BiRefNet"
 MAX_SEED = np.iinfo(np.int32).max
+DEFAULT_ATTENTION_BACKEND = "flash_attn_3"
+DEFAULT_SPARSE_ATTENTION_BACKEND = "flash_attn"
+PIXAL3D_ATTENTION_BACKENDS = (
+    "flash_attn_3",
+    "flash_attn",
+    "sdpa",
+    "xformers",
+    "naive",
+    "flash_attn_4",
+)
+PIXAL3D_SPARSE_ATTENTION_BACKENDS = (
+    "auto",
+    "flash_attn_3",
+    "flash_attn",
+    "xformers",
+    "flash_attn_4",
+)
 NAF_ATTENTION_BACKENDS = (
     "auto",
     "torch",
@@ -65,6 +83,8 @@ class Pixal3DContext:
     moge_model_name: str
     device: str
     low_vram: bool
+    attention_backend: str
+    sparse_attention_backend: str
     naf_attention_backend: str
     pipeline: Any
     moge_model: Any
@@ -72,15 +92,27 @@ class Pixal3DContext:
 
 
 @dataclass
+class Pixal3DBackgroundRemoverContext:
+    root: str
+    model_name: str
+    device: str
+    low_vram: bool
+    model: Any
+    lock: threading.Lock
+
+
+@dataclass
 class Pixal3DResult:
-    glb_path: str
-    preprocessed_image: Image.Image
+    glb_data: bytes
     camera_params: Dict[str, float]
     resolution: int
 
 
-_MODEL_CACHE: Dict[Tuple[str, str, str, str, bool, str], Pixal3DContext] = {}
+_MODEL_CACHE: Dict[Tuple[str, str, str, str, bool, str, str, str], Pixal3DContext] = {}
 _MODEL_CACHE_LOCK = threading.Lock()
+_PIXAL3D_RUN_LOCK = threading.Lock()
+_REMBG_CACHE: Dict[Tuple[str, str, str, bool], Pixal3DBackgroundRemoverContext] = {}
+_REMBG_CACHE_LOCK = threading.Lock()
 _HF_SNAPSHOT_CACHE: Dict[Tuple[str, Tuple[str, ...]], str] = {}
 _HF_SNAPSHOT_CACHE_LOCK = threading.Lock()
 
@@ -207,17 +239,79 @@ def resolve_pixal3d_root(pixal3d_root: Optional[str] = None) -> str:
     return os.path.abspath(os.path.expanduser(str(configured_root).strip()))
 
 
-def configure_pixal3d_environment(pixal3d_root: str) -> None:
+def configure_pixal3d_source_path(pixal3d_root: str) -> None:
+    if pixal3d_root not in sys.path:
+        sys.path.insert(0, pixal3d_root)
+
+
+def normalize_attention_backend(value: Optional[str]) -> str:
+    backend = (
+        value
+        or os.environ.get("PIXAL3D_ATTENTION_BACKEND")
+        or os.environ.get("ATTN_BACKEND")
+        or DEFAULT_ATTENTION_BACKEND
+    ).strip()
+    if backend not in PIXAL3D_ATTENTION_BACKENDS:
+        choices = ", ".join(PIXAL3D_ATTENTION_BACKENDS)
+        raise ValueError(
+            f"Invalid Pixal3D attention backend '{backend}'. Expected one of: {choices}."
+        )
+    return backend
+
+
+def normalize_sparse_attention_backend(
+    value: Optional[str],
+    attention_backend: Optional[str],
+) -> str:
+    backend = (
+        value
+        or os.environ.get("PIXAL3D_SPARSE_ATTENTION_BACKEND")
+        or os.environ.get("SPARSE_ATTN_BACKEND")
+        or "auto"
+    ).strip()
+    valid_sparse_backends = PIXAL3D_SPARSE_ATTENTION_BACKENDS[1:]
+    if backend == "auto":
+        dense_backend = normalize_attention_backend(attention_backend)
+        if dense_backend in valid_sparse_backends:
+            return dense_backend
+        return DEFAULT_SPARSE_ATTENTION_BACKEND
+    if backend not in valid_sparse_backends:
+        choices = ", ".join(PIXAL3D_SPARSE_ATTENTION_BACKENDS)
+        raise ValueError(
+            f"Invalid Pixal3D sparse attention backend '{backend}'. Expected one of: {choices}."
+        )
+    return backend
+
+
+def apply_pixal3d_attention_backends(
+    attention_backend: str,
+    sparse_attention_backend: str,
+) -> None:
+    os.environ["ATTN_BACKEND"] = attention_backend
+    os.environ["SPARSE_ATTN_BACKEND"] = sparse_attention_backend
+
+    attention_config = sys.modules.get("pixal3d.modules.attention.config")
+    if attention_config is not None:
+        attention_config.set_backend(attention_backend)
+
+    sparse_config = sys.modules.get("pixal3d.modules.sparse.config")
+    if sparse_config is not None:
+        sparse_config.set_attn_backend(sparse_attention_backend)
+
+
+def configure_pixal3d_environment(
+    pixal3d_root: str,
+    attention_backend: str,
+    sparse_attention_backend: str,
+) -> None:
     os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-    os.environ.setdefault("ATTN_BACKEND", "flash_attn_3")
+    apply_pixal3d_attention_backends(attention_backend, sparse_attention_backend)
     os.environ["FLEX_GEMM_AUTOTUNE_CACHE_PATH"] = os.path.join(
         pixal3d_root, "autotune_cache.json"
     )
     os.environ.setdefault("FLEX_GEMM_AUTOTUNER_VERBOSE", "1")
-
-    if pixal3d_root not in sys.path:
-        sys.path.insert(0, pixal3d_root)
+    configure_pixal3d_source_path(pixal3d_root)
 
 
 def require_cuda_device(device: str) -> None:
@@ -498,6 +592,151 @@ def _patch_rembg_cache_resolution() -> None:
     rembg.BiRefNet = CachedBiRefNet
 
 
+class _DisabledBackgroundRemover:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def to(self, _device: Any) -> "_DisabledBackgroundRemover":
+        return self
+
+    def cuda(self) -> "_DisabledBackgroundRemover":
+        return self
+
+    def cpu(self) -> "_DisabledBackgroundRemover":
+        return self
+
+    def __call__(self, _image: Image.Image) -> Image.Image:
+        raise RuntimeError(
+            "Pixal3D background removal is disabled in the 3D model loader. "
+            "Use Pixal3D Background Remover Loader with Pixal3D Preprocess Image."
+        )
+
+
+def _load_pipeline_without_background_remover(pipeline_cls: Any, model_path: str) -> Any:
+    from pixal3d.pipelines import rembg
+
+    original_birefnet = getattr(rembg, "BiRefNet", None)
+    if original_birefnet is None:
+        return pipeline_cls.from_pretrained(model_path)
+
+    rembg.BiRefNet = _DisabledBackgroundRemover
+    try:
+        pipeline = pipeline_cls.from_pretrained(model_path)
+    finally:
+        rembg.BiRefNet = original_birefnet
+    pipeline.rembg_model = None
+    return pipeline
+
+
+def load_pixal3d_background_remover_context(
+    pixal3d_root: Optional[str] = None,
+    model_name: str = DEFAULT_REMBG_MODEL,
+    device: str = "cuda",
+    low_vram: bool = True,
+    force_reload: bool = False,
+) -> Pixal3DBackgroundRemoverContext:
+    root = resolve_pixal3d_root(pixal3d_root)
+    package_init = os.path.join(root, "pixal3d", "__init__.py")
+    if not os.path.isdir(root) or not os.path.isfile(package_init):
+        raise RuntimeError(
+            "Bundled Pixal3D source was not found. Expected a pixal3d package at: "
+            f"{root}"
+        )
+
+    require_cuda_device(device)
+    key = (root, model_name.strip(), device.strip(), bool(low_vram))
+
+    with _REMBG_CACHE_LOCK:
+        if force_reload:
+            _REMBG_CACHE.pop(key, None)
+            torch.cuda.empty_cache()
+        if key in _REMBG_CACHE:
+            return _REMBG_CACHE[key]
+
+        configure_pixal3d_source_path(root)
+        _patch_rembg_cache_resolution()
+
+        from pixal3d.pipelines import rembg
+
+        model = rembg.BiRefNet(model_name.strip())
+        model.to(device)
+        if low_vram:
+            model.cpu()
+
+        context = Pixal3DBackgroundRemoverContext(
+            root=root,
+            model_name=model_name.strip(),
+            device=device.strip(),
+            low_vram=bool(low_vram),
+            model=model,
+            lock=threading.Lock(),
+        )
+        _REMBG_CACHE[key] = context
+        return context
+
+
+def preprocess_image_with_background_remover(
+    context: Pixal3DBackgroundRemoverContext,
+    image: Image.Image,
+    background_color: str = "#000000",
+) -> Image.Image:
+    bg_color = parse_rgb_color(background_color)
+
+    with context.lock:
+        input_image = image
+        has_alpha = False
+        if input_image.mode == "RGBA":
+            alpha = np.array(input_image)[:, :, 3]
+            if not np.all(alpha == 255):
+                has_alpha = True
+
+        max_size = max(input_image.size)
+        scale = min(1, 1024 / max_size)
+        if scale < 1:
+            input_image = input_image.resize(
+                (int(input_image.width * scale), int(input_image.height * scale)),
+                Image.Resampling.LANCZOS,
+            )
+
+        if has_alpha:
+            output = input_image
+        else:
+            input_image = input_image.convert("RGB")
+            if context.low_vram:
+                context.model.to(context.device)
+            output = context.model(input_image)
+            if context.low_vram:
+                context.model.cpu()
+
+        output_np = np.array(output)
+        alpha = output_np[:, :, 3]
+        bbox_points = np.argwhere(alpha > 0.8 * 255)
+        if bbox_points.size == 0:
+            raise RuntimeError("Background remover did not find a foreground object.")
+        bbox = (
+            np.min(bbox_points[:, 1]),
+            np.min(bbox_points[:, 0]),
+            np.max(bbox_points[:, 1]),
+            np.max(bbox_points[:, 0]),
+        )
+        center = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+        size = max(bbox[2] - bbox[0], bbox[3] - bbox[1])
+        size = int(size * 1.1)
+        crop_box = (
+            center[0] - size // 2,
+            center[1] - size // 2,
+            center[0] + size // 2,
+            center[1] + size // 2,
+        )
+        output = output.crop(crop_box)
+        output = np.array(output).astype(np.float32) / 255
+        rgb = output[:, :, :3]
+        alpha = output[:, :, 3:4]
+        bg = np.array(bg_color, dtype=np.float32) / 255.0
+        composited = rgb * alpha + bg * (1.0 - alpha)
+        return Image.fromarray((np.clip(composited, 0, 1) * 255).astype(np.uint8))
+
+
 def _move_image_cond_models(pipeline: Any, device: str, low_vram: bool) -> None:
     for attr in (
         "image_cond_model_ss",
@@ -544,6 +783,8 @@ def load_pixal3d_context(
     device: str = "cuda",
     low_vram: bool = True,
     preload_naf: bool = True,
+    attention_backend: Optional[str] = None,
+    sparse_attention_backend: Optional[str] = None,
     naf_attention_backend: str = "auto",
     force_reload: bool = False,
 ) -> Pixal3DContext:
@@ -556,6 +797,11 @@ def load_pixal3d_context(
         )
 
     require_cuda_device(device)
+    attention_backend = normalize_attention_backend(attention_backend)
+    sparse_attention_backend = normalize_sparse_attention_backend(
+        sparse_attention_backend,
+        attention_backend,
+    )
     naf_attention_backend = normalize_naf_attention_backend(naf_attention_backend)
     key = (
         root,
@@ -563,6 +809,8 @@ def load_pixal3d_context(
         moge_model_name.strip(),
         device.strip(),
         bool(low_vram),
+        attention_backend,
+        sparse_attention_backend,
         naf_attention_backend,
     )
 
@@ -571,9 +819,14 @@ def load_pixal3d_context(
             _MODEL_CACHE.pop(key, None)
             torch.cuda.empty_cache()
         if key in _MODEL_CACHE:
-            return _MODEL_CACHE[key]
+            context = _MODEL_CACHE[key]
+            apply_pixal3d_attention_backends(
+                context.attention_backend,
+                context.sparse_attention_backend,
+            )
+            return context
 
-        configure_pixal3d_environment(root)
+        configure_pixal3d_environment(root, attention_backend, sparse_attention_backend)
 
         try:
             from moge.model.v2 import MoGeModel
@@ -587,7 +840,10 @@ def load_pixal3d_context(
         _patch_rembg_cache_resolution()
 
         resolved_model_path = _resolve_pixal3d_model_path(model_path.strip())
-        pipeline = Pixal3DImageTo3DPipeline.from_pretrained(resolved_model_path)
+        pipeline = _load_pipeline_without_background_remover(
+            Pixal3DImageTo3DPipeline,
+            resolved_model_path,
+        )
         pipeline.image_cond_model_ss = build_image_cond_model(
             IMAGE_COND_CONFIGS["ss"],
             naf_attention_backend,
@@ -626,6 +882,8 @@ def load_pixal3d_context(
             moge_model_name=moge_model_name.strip(),
             device=device.strip(),
             low_vram=bool(low_vram),
+            attention_backend=attention_backend,
+            sparse_attention_backend=sparse_attention_backend,
             naf_attention_backend=naf_attention_backend,
             pipeline=pipeline,
             moge_model=moge_model,
@@ -733,26 +991,6 @@ def estimate_camera_params(
     }
 
 
-def sanitize_output_prefix(prefix: str) -> str:
-    basename = os.path.basename(prefix.strip() or "pixal3d")
-    basename = os.path.splitext(basename)[0]
-    basename = re.sub(r"[^A-Za-z0-9._-]+", "_", basename).strip("._-")
-    return basename or "pixal3d"
-
-
-def make_output_path(output_dir: str, output_prefix: str, seed: int) -> str:
-    out_dir = Path(output_dir) / "pixal3d"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    stem = f"{sanitize_output_prefix(output_prefix)}_{timestamp}_seed{int(seed)}"
-    candidate = out_dir / f"{stem}.glb"
-    counter = 1
-    while candidate.exists():
-        candidate = out_dir / f"{stem}_{counter:02d}.glb"
-        counter += 1
-    return str(candidate)
-
-
 def default_sampler_settings() -> Dict[str, Dict[str, float]]:
     return {
         "sparse_structure": {
@@ -812,16 +1050,43 @@ def make_sampler_settings(
     }
 
 
-def run_pixal3d_to_glb(
+def _export_glb_to_bytes(glb: Any, extension_webp: bool) -> bytes:
+    buffer = BytesIO()
+    try:
+        exported = glb.export(
+            buffer,
+            file_type="glb",
+            extension_webp=bool(extension_webp),
+        )
+    except TypeError:
+        try:
+            exported = glb.export(file_type="glb", extension_webp=bool(extension_webp))
+        except TypeError:
+            exported = glb.export(file_type="glb")
+
+    if isinstance(exported, bytes):
+        return exported
+    if isinstance(exported, bytearray):
+        return bytes(exported)
+
+    data = buffer.getvalue()
+    if data:
+        return data
+
+    if exported is None:
+        raise RuntimeError("GLB export produced no data.")
+    if isinstance(exported, str):
+        return exported.encode("utf-8")
+    raise RuntimeError(f"Unexpected GLB export result: {type(exported).__name__}.")
+
+
+def run_pixal3d_to_3d(
     context: Pixal3DContext,
     image: Image.Image,
-    output_path: str,
     sampler_settings: Optional[Dict[str, Dict[str, float]]] = None,
     *,
     seed: int = 42,
     pipeline_type: str = "1024_cascade",
-    preprocess_image: bool = True,
-    background_color: str = "#000000",
     mesh_scale: float = 1.0,
     extend_pixel: int = 0,
     image_resolution: int = 512,
@@ -843,19 +1108,18 @@ def run_pixal3d_to_glb(
         if progress_callback is not None:
             progress_callback(label, step, total)
 
-    with context.lock:
+    with _PIXAL3D_RUN_LOCK, context.lock:
+        apply_pixal3d_attention_backends(
+            context.attention_backend,
+            context.sparse_attention_backend,
+        )
         torch.manual_seed(int(seed))
 
-        update("preprocess", 0, 4)
-        if preprocess_image:
-            bg_color = parse_rgb_color(background_color)
-            image_preprocessed = pipeline.preprocess_image(image, bg_color=bg_color)
-        else:
-            image_preprocessed = image.convert("RGB")
+        image_for_generation = image.convert("RGB")
 
-        update("camera", 1, 4)
+        update("camera", 0, 3)
         camera_params = estimate_camera_params(
-            image_preprocessed,
+            image_for_generation,
             context.moge_model,
             device=context.device,
             mesh_scale=float(mesh_scale),
@@ -863,10 +1127,10 @@ def run_pixal3d_to_glb(
             image_resolution=int(image_resolution),
         )
 
-        update("generate", 2, 4)
+        update("generate", 1, 3)
         with torch.no_grad():
             mesh_list, (_shape_slat, _tex_slat, res) = pipeline.run(
-                image_preprocessed,
+                image_for_generation,
                 camera_params=camera_params,
                 seed=int(seed),
                 sparse_structure_sampler_params=settings["sparse_structure"],
@@ -880,7 +1144,7 @@ def run_pixal3d_to_glb(
 
             mesh = mesh_list[0]
 
-            update("export", 3, 4)
+            update("export", 2, 3)
             glb = o_voxel.postprocess.to_glb(
                 vertices=mesh.vertices,
                 faces=mesh.faces,
@@ -907,19 +1171,17 @@ def run_pixal3d_to_glb(
                 dtype=np.float64,
             )
             glb.apply_transform(rotation)
-
-            os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-            glb.export(output_path, extension_webp=bool(extension_webp))
+            glb_data = _export_glb_to_bytes(glb, bool(extension_webp))
 
         torch.cuda.empty_cache()
-        update("done", 4, 4)
+        update("done", 3, 3)
 
     return Pixal3DResult(
-        glb_path=os.path.abspath(output_path),
-        preprocessed_image=image_preprocessed,
+        glb_data=glb_data,
         camera_params=camera_params,
         resolution=int(res),
     )
+
 
 
 def camera_params_to_json(camera_params: Dict[str, float], resolution: int) -> str:

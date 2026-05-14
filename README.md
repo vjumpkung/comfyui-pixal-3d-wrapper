@@ -1,15 +1,16 @@
 # ComfyUI Pixal3D Wrapper
 
-ComfyUI custom nodes for running Pixal3D image-to-GLB generation. The Pixal3D
+ComfyUI custom nodes for running Pixal3D image-to-3D generation. The Pixal3D
 inference source is bundled in this custom node under `vendor/Pixal3D`, so the
 loader does not require a separate `~/Documents/Pixal3D` path.
 
 ## Nodes
 
 - **Pixal3D Model Loader**: loads Pixal3D, MoGe, and DINO/NAF conditioning models.
+- **Pixal3D Background Remover Loader**: loads the optional upstream background remover used by preprocessing.
 - **Pixal3D Sampler Settings**: optional advanced sampler controls matching the upstream Pixal3D inference defaults.
 - **Pixal3D Preprocess Image**: runs Pixal3D background removal/crop preprocessing and returns an `IMAGE`.
-- **Pixal3D Image to GLB**: output node that generates a GLB, returns the GLB path, a `FILE_3D_GLB` mesh output for ComfyUI's 3D viewer, the preprocessed image, and camera metadata JSON.
+- **Pixal3D Image to 3D**: generates an in-memory `FILE_3D_GLB` and camera metadata JSON without saving directly.
 
 ## Setup
 
@@ -24,6 +25,14 @@ loader's `naf_attention_backend` at `auto` or select `torch`. The `torch`
 fallback is slower, but supports NAF's mismatched QK/V head dimensions when
 NATTEN Flex cannot.
 
+The loader's `attention_backend` controls Pixal3D dense attention and can be set
+to `flash_attn_3`, `flash_attn`, `sdpa`, `xformers`, `naive`, or
+`flash_attn_4`. `sparse_attention_backend` controls Pixal3D sparse attention;
+its `auto` default follows the dense backend when sparse attention supports it,
+otherwise it falls back to `flash_attn`. Sparse Pixal3D attention does not have
+an `sdpa` implementation, so use `flash_attn`, `flash_attn_3`, `flash_attn_4`,
+or `xformers` there.
+
 Pixal3D also requires the upstream `utils3d` wheel:
 
 ```bash
@@ -37,15 +46,15 @@ before starting ComfyUI.
 ## Basic Workflow
 
 1. Add **Pixal3D Model Loader**.
-2. Connect its output to **Pixal3D Image to GLB**.
-3. Connect a ComfyUI `IMAGE` to **Pixal3D Image to GLB**.
-4. Queue the graph.
+2. Connect its output to **Pixal3D Image to 3D**.
+3. Connect a ComfyUI `IMAGE` to **Pixal3D Image to 3D**.
+4. Connect `model_3d` to ComfyUI's built-in **Save 3D Model** or **Preview 3D & Animation** node.
+5. Queue the graph.
 
-The `mesh` output from **Pixal3D Image to GLB** can be connected directly to
-ComfyUI's built-in **Preview 3D & Animation** node.
-
-Generated files are written to `ComfyUI/output/pixal3d/*.glb`.
+**Pixal3D Image to 3D** does not run background removal/crop preprocessing. To
+use that optional step, add **Pixal3D Background Remover Loader**, connect it to
+**Pixal3D Preprocess Image**, then connect the preprocessed image to **Pixal3D
+Image to 3D**.
 
 Use **Pixal3D Sampler Settings** only when you want to override the upstream
-defaults. If you pass an image that was already processed by **Pixal3D Preprocess
-Image**, set `preprocess_image` to `false` on **Pixal3D Image to GLB**.
+defaults.

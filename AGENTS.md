@@ -18,7 +18,8 @@ stack installed in the same Python environment that runs ComfyUI.
 - `nodes.py`: defines the ComfyUI nodes and UI-facing input/output contracts.
 - `pixal3d_runtime.py`: lazy model loading, model cache, Hugging Face
   cache-first model resolution, NAF attention backend patching, image
-  conversion, camera estimation, Pixal3D pipeline execution, and GLB export.
+  conversion, optional background removal preprocessing, camera estimation,
+  Pixal3D pipeline execution, and in-memory GLB export.
 - `vendor/Pixal3D`: bundled upstream Pixal3D inference source, requirements,
   and license.
 - `requirements.txt`: helper dependency list for Pixal3D-side dependencies.
@@ -27,14 +28,15 @@ stack installed in the same Python environment that runs ComfyUI.
 ## Nodes
 
 - `Pixal3D Model Loader`: loads and caches Pixal3D, MoGe, and DINO/NAF models.
+- `Pixal3D Background Remover Loader`: loads and caches the optional upstream
+  background remover used by preprocessing.
 - `Pixal3D Sampler Settings`: optional sampler overrides matching upstream
   Pixal3D defaults.
-- `Pixal3D Preprocess Image`: runs Pixal3D preprocessing and returns a ComfyUI
-  `IMAGE`.
-- `Pixal3D Image to GLB`: output node that writes
-  `ComfyUI/output/pixal3d/*.glb` and returns the GLB path, preprocessed image,
-  camera metadata JSON, and a `FILE_3D_GLB` mesh output for ComfyUI preview
-  nodes.
+- `Pixal3D Preprocess Image`: runs Pixal3D-style background removal/crop
+  preprocessing with a `PIXAL3D_REMBG_MODEL` and returns a ComfyUI `IMAGE`.
+- `Pixal3D Image to 3D`: generates an in-memory `FILE_3D_GLB` and camera
+  metadata JSON. It is not an output node and does not save directly; connect
+  `model_3d` to ComfyUI's built-in `Save 3D Model` node to write a file.
 
 ## Runtime Notes
 
@@ -43,10 +45,12 @@ stack installed in the same Python environment that runs ComfyUI.
 - The bundled Pixal3D source root is `vendor/Pixal3D`, resolved internally
   relative to `pixal3d_runtime.py`.
 - `Pixal3D Model Loader` intentionally does not expose `pixal3d_root`.
-- The loader defaults exposed in ComfyUI are:
+- The Pixal3D model loader defaults exposed in ComfyUI are:
   - `model_path`: `TencentARC/Pixal3D`
   - `moge_model_name`: `Ruicheng/moge-2-vitl`
   - `device`: `cuda`
+  - `attention_backend`: `flash_attn_3`
+  - `sparse_attention_backend`: `auto`
   - `naf_attention_backend`: `auto`
 - To test an external Pixal3D checkout, set `PIXAL3D_ROOT` before starting
   ComfyUI. Do not re-add a normal loader widget for this unless the user asks.
@@ -55,6 +59,13 @@ stack installed in the same Python environment that runs ComfyUI.
   snapshot files; download only on cache miss or incomplete snapshot.
 - `low_vram=True` keeps Pixal3D behavior conservative and moves conditioning
   models on demand.
+- `Pixal3D Image to 3D` intentionally does not call Pixal3D preprocessing.
+  Preprocessing is a separate background-removal workflow using `Pixal3D
+  Background Remover Loader` and `Pixal3D Preprocess Image`.
+- Pixal3D dense attention backends are `flash_attn_3`, `flash_attn`, `sdpa`,
+  `xformers`, `naive`, and `flash_attn_4`. Sparse attention backends are
+  `auto`, `flash_attn_3`, `flash_attn`, `xformers`, and `flash_attn_4`; sparse
+  attention does not support `sdpa`.
 - NAF attention backends are `auto`, `torch`, `flex-fna`, `cutlass-fna`,
   `hopper-fna`, and `blackwell-fna`. On Windows, NATTEN often lacks libnatten,
   so `auto` may need the wrapper-side `torch` fallback for NAF's mismatched QK/V
@@ -62,8 +73,6 @@ stack installed in the same Python environment that runs ComfyUI.
   NATTEN backends.
 - Full generation is serialized with the cached context lock to avoid concurrent
   mutation of shared model state.
-- If an image has already gone through `Pixal3D Preprocess Image`, set
-  `preprocess_image=false` on `Pixal3D Image to GLB`.
 
 ## Development Rules
 
@@ -121,7 +130,8 @@ PY
 
 Expected node keys:
 
-- `Pixal3DImageToGLB`
+- `Pixal3DBackgroundRemoverLoader`
+- `Pixal3DImageTo3D`
 - `Pixal3DModelLoader`
 - `Pixal3DPreprocessImage`
 - `Pixal3DSamplerSettings`

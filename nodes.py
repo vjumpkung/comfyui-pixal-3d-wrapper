@@ -1,4 +1,4 @@
-import os
+from io import BytesIO
 from typing import Any, Dict, Optional
 
 import torch
@@ -6,22 +6,21 @@ import torch
 from .pixal3d_runtime import (
     DEFAULT_MODEL_PATH,
     DEFAULT_MOGE_MODEL,
+    DEFAULT_REMBG_MODEL,
     MAX_SEED,
     NAF_ATTENTION_BACKENDS,
+    PIXAL3D_ATTENTION_BACKENDS,
+    PIXAL3D_SPARSE_ATTENTION_BACKENDS,
     camera_params_to_json,
     default_sampler_settings,
     image_tensor_to_pil,
+    load_pixal3d_background_remover_context,
     load_pixal3d_context,
-    make_output_path,
     make_sampler_settings,
     pil_to_image_tensor,
-    run_pixal3d_to_glb,
+    preprocess_image_with_background_remover,
+    run_pixal3d_to_3d,
 )
-
-try:
-    import folder_paths
-except ImportError:
-    folder_paths = None
 
 try:
     from comfy.utils import ProgressBar
@@ -29,16 +28,10 @@ except ImportError:
     ProgressBar = None
 
 
-def _output_directory() -> str:
-    if folder_paths is not None:
-        return folder_paths.get_output_directory()
-    return os.path.join(os.getcwd(), "output")
-
-
 def _progress_callback() -> Any:
     if ProgressBar is None:
         return None
-    pbar = ProgressBar(4)
+    pbar = ProgressBar(3)
 
     def update(_label: str, step: int, _total: int) -> None:
         if step > 0:
@@ -47,30 +40,12 @@ def _progress_callback() -> Any:
     return update
 
 
-def _glb_file_output(glb_path: str) -> Any:
+def _glb_file_output(glb_data: bytes) -> Any:
     try:
         from comfy_api.latest import Types
     except Exception:
-        return glb_path
-    return Types.File3D(glb_path, "glb")
-
-
-def _glb_preview_item(glb_path: str) -> Dict[str, str]:
-    output_dir = os.path.abspath(_output_directory())
-    abs_path = os.path.abspath(glb_path)
-    try:
-        rel_path = os.path.relpath(abs_path, output_dir)
-    except ValueError:
-        rel_path = os.path.basename(abs_path)
-    if rel_path == ".." or rel_path.startswith(".." + os.sep):
-        rel_path = os.path.basename(abs_path)
-
-    subfolder = os.path.dirname(rel_path).replace("\\", "/")
-    return {
-        "filename": os.path.basename(rel_path),
-        "subfolder": subfolder,
-        "type": "output",
-    }
+        return BytesIO(glb_data)
+    return Types.File3D(BytesIO(glb_data), "glb")
 
 
 class Pixal3DModelLoader:
@@ -101,6 +76,14 @@ class Pixal3DModelLoader:
                 ),
                 "low_vram": ("BOOLEAN", {"default": True}),
                 "preload_naf": ("BOOLEAN", {"default": True}),
+                "attention_backend": (
+                    list(PIXAL3D_ATTENTION_BACKENDS),
+                    {"default": "flash_attn_3"},
+                ),
+                "sparse_attention_backend": (
+                    list(PIXAL3D_SPARSE_ATTENTION_BACKENDS),
+                    {"default": "auto"},
+                ),
                 "naf_attention_backend": (
                     list(NAF_ATTENTION_BACKENDS),
                     {"default": "auto"},
@@ -121,6 +104,8 @@ class Pixal3DModelLoader:
         device: str,
         low_vram: bool,
         preload_naf: bool,
+        attention_backend: str,
+        sparse_attention_backend: str,
         naf_attention_backend: str,
         force_reload: bool,
     ):
@@ -130,7 +115,54 @@ class Pixal3DModelLoader:
             device=device,
             low_vram=low_vram,
             preload_naf=preload_naf,
+            attention_backend=attention_backend,
+            sparse_attention_backend=sparse_attention_backend,
             naf_attention_backend=naf_attention_backend,
+            force_reload=force_reload,
+        )
+        return (context,)
+
+
+class Pixal3DBackgroundRemoverLoader:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model_name": (
+                    "STRING",
+                    {
+                        "default": DEFAULT_REMBG_MODEL,
+                        "placeholder": "ZhengPeng7/BiRefNet",
+                    },
+                ),
+                "device": (
+                    "STRING",
+                    {
+                        "default": "cuda",
+                        "placeholder": "cuda",
+                    },
+                ),
+                "low_vram": ("BOOLEAN", {"default": True}),
+                "force_reload": ("BOOLEAN", {"default": False}),
+            }
+        }
+
+    RETURN_TYPES = ("PIXAL3D_REMBG_MODEL",)
+    RETURN_NAMES = ("rembg_model",)
+    FUNCTION = "load"
+    CATEGORY = "Pixal3D"
+
+    def load(
+        self,
+        model_name: str,
+        device: str,
+        low_vram: bool,
+        force_reload: bool,
+    ):
+        context = load_pixal3d_background_remover_context(
+            model_name=model_name,
+            device=device,
+            low_vram=low_vram,
             force_reload=force_reload,
         )
         return (context,)
@@ -235,7 +267,7 @@ class Pixal3DPreprocessImage:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "pixal3d_model": ("PIXAL3D_MODEL", {"forceInput": True}),
+                "rembg_model": ("PIXAL3D_REMBG_MODEL", {"forceInput": True}),
                 "image": ("IMAGE", {}),
                 "batch_index": ("INT", {"default": 0, "min": 0, "max": 4096}),
                 "background_color": ("STRING", {"default": "#000000"}),
@@ -249,35 +281,32 @@ class Pixal3DPreprocessImage:
 
     def preprocess(
         self,
-        pixal3d_model: Any,
+        rembg_model: Any,
         image: torch.Tensor,
         batch_index: int,
         background_color: str,
     ):
-        from .pixal3d_runtime import parse_rgb_color
-
-        with pixal3d_model.lock:
-            pil_image = image_tensor_to_pil(image, batch_index)
-            bg_color = parse_rgb_color(background_color)
-            preprocessed = pixal3d_model.pipeline.preprocess_image(pil_image, bg_color=bg_color)
+        pil_image = image_tensor_to_pil(image, batch_index)
+        preprocessed = preprocess_image_with_background_remover(
+            rembg_model,
+            pil_image,
+            background_color=background_color,
+        )
         return (pil_to_image_tensor(preprocessed),)
 
 
-class Pixal3DImageToGLB:
+class Pixal3DImageTo3D:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "pixal3d_model": ("PIXAL3D_MODEL", {"forceInput": True}),
                 "image": ("IMAGE", {}),
-                "output_prefix": ("STRING", {"default": "pixal3d"}),
                 "seed": (
                     "INT",
                     {"default": 42, "min": 0, "max": int(MAX_SEED)},
                 ),
                 "pipeline_type": (["1024_cascade", "1536_cascade"],),
-                "preprocess_image": ("BOOLEAN", {"default": True}),
-                "background_color": ("STRING", {"default": "#000000"}),
                 "batch_index": ("INT", {"default": 0, "min": 0, "max": 4096}),
                 "mesh_scale": (
                     "FLOAT",
@@ -310,21 +339,17 @@ class Pixal3DImageToGLB:
             },
         }
 
-    RETURN_TYPES = ("STRING", "IMAGE", "STRING", "FILE_3D_GLB")
-    RETURN_NAMES = ("glb_path", "preprocessed_image", "camera_json", "mesh")
+    RETURN_TYPES = ("FILE_3D_GLB", "STRING")
+    RETURN_NAMES = ("model_3d", "camera_json")
     FUNCTION = "generate"
-    OUTPUT_NODE = True
     CATEGORY = "Pixal3D"
 
     def generate(
         self,
         pixal3d_model: Any,
         image: torch.Tensor,
-        output_prefix: str,
         seed: int,
         pipeline_type: str,
-        preprocess_image: bool,
-        background_color: str,
         batch_index: int,
         mesh_scale: float,
         extend_pixel: int,
@@ -339,18 +364,14 @@ class Pixal3DImageToGLB:
         sampler_settings: Optional[Dict[str, Dict[str, float]]] = None,
     ):
         pil_image = image_tensor_to_pil(image, batch_index)
-        output_path = make_output_path(_output_directory(), output_prefix, seed)
         settings = sampler_settings or default_sampler_settings()
 
-        result = run_pixal3d_to_glb(
+        result = run_pixal3d_to_3d(
             pixal3d_model,
             pil_image,
-            output_path,
             settings,
             seed=seed,
             pipeline_type=pipeline_type,
-            preprocess_image=preprocess_image,
-            background_color=background_color,
             mesh_scale=mesh_scale,
             extend_pixel=extend_pixel,
             image_resolution=image_resolution,
@@ -364,27 +385,21 @@ class Pixal3DImageToGLB:
             progress_callback=_progress_callback(),
         )
         camera_json = camera_params_to_json(result.camera_params, result.resolution)
-        preprocessed_tensor = pil_to_image_tensor(result.preprocessed_image)
-        mesh = _glb_file_output(result.glb_path)
-        return {
-            "ui": {
-                "3d": [_glb_preview_item(result.glb_path)],
-                "text": [result.glb_path, camera_json],
-            },
-            "result": (result.glb_path, preprocessed_tensor, camera_json, mesh),
-        }
+        return (_glb_file_output(result.glb_data), camera_json)
 
 
 NODE_CLASS_MAPPINGS = {
     "Pixal3DModelLoader": Pixal3DModelLoader,
+    "Pixal3DBackgroundRemoverLoader": Pixal3DBackgroundRemoverLoader,
     "Pixal3DSamplerSettings": Pixal3DSamplerSettings,
     "Pixal3DPreprocessImage": Pixal3DPreprocessImage,
-    "Pixal3DImageToGLB": Pixal3DImageToGLB,
+    "Pixal3DImageTo3D": Pixal3DImageTo3D,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Pixal3DModelLoader": "Pixal3D Model Loader",
+    "Pixal3DBackgroundRemoverLoader": "Pixal3D Background Remover Loader",
     "Pixal3DSamplerSettings": "Pixal3D Sampler Settings",
     "Pixal3DPreprocessImage": "Pixal3D Preprocess Image",
-    "Pixal3DImageToGLB": "Pixal3D Image to GLB",
+    "Pixal3DImageTo3D": "Pixal3D Image to 3D",
 }
