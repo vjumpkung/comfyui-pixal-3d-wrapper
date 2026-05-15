@@ -37,12 +37,18 @@ or `xformers` there.
 Pixal3D also requires the upstream `utils3d` wheel:
 
 ```bash
-pip install https://github.com/LDYang694/Storages/releases/download/20260430/utils3d-0.0.2-py3-none-any.whl
+pip install utils3d
 ```
 
 The bundled Pixal3D source path is resolved relative to this wrapper. If you need
 to test a different Pixal3D checkout, set `PIXAL3D_ROOT` in the environment
 before starting ComfyUI.
+
+## This Custom Nodes require like a TRELLIS.2 
+
+- Prebuilt wheels for TRELLIS.2 can be used too.
+- Example Wheels : https://github.com/visualbruno/ComfyUI-Trellis2/tree/main/wheels
+- If you want to use it in runpod : https://console.runpod.io/deploy?template=o5gnyb1fzu&ref=6h6f9kga
 
 ## Debugging Load
 
@@ -74,3 +80,8 @@ Image to 3D**.
 
 Use **Pixal3D Sampler Settings** only when you want to override the upstream
 defaults.
+
+## Reference 
+
+- https://github.com/TencentARC/Pixal3D
+- https://huggingface.co/TencentARC/Pixal3D

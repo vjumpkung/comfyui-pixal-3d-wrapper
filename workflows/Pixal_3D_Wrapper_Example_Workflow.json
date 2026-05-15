@@ -1,0 +1,377 @@
+{
+  "id": "a69c6f9f-96dd-43b6-a6c4-24c95fecafee",
+  "revision": 0,
+  "last_node_id": 15,
+  "last_link_id": 15,
+  "nodes": [
+    {
+      "id": 7,
+      "type": "SaveGLB",
+      "pos": [
+        1260.9504115183856,
+        235.9024746153434
+      ],
+      "size": [
+        400,
+        550
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "mesh",
+          "type": "MESH,FILE_3D_GLB,FILE_3D_GLTF,FILE_3D_OBJ,FILE_3D_FBX,FILE_3D_STL,FILE_3D_USDZ,FILE_3D",
+          "link": 6
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.21.1",
+        "Scene Config": {
+          "showGrid": true,
+          "backgroundColor": "#282828",
+          "backgroundImage": "",
+          "backgroundRenderMode": "tiled"
+        },
+        "Camera Config": {
+          "cameraType": "perspective",
+          "fov": 35,
+          "state": {
+            "position": {
+              "x": 0.2573146011452354,
+              "y": 3.313467273933808,
+              "z": -14.223338598513068
+            },
+            "target": {
+              "x": 8.85160872915007e-50,
+              "y": 2.5,
+              "z": 1.6166095094762498e-49
+            },
+            "zoom": 1,
+            "cameraType": "perspective"
+          }
+        },
+        "Light Config": {
+          "intensity": 3
+        }
+      },
+      "widgets_values": [
+        "3d/ComfyUI",
+        ""
+      ]
+    },
+    {
+      "id": 13,
+      "type": "Pixal3DPreprocessImage",
+      "pos": [
+        480.43381228195244,
+        590.4451086363894
+      ],
+      "size": [
+        301.142578125,
+        102
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "rembg_model",
+          "type": "PIXAL3D_REMBG_MODEL",
+          "link": 15
+        },
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 13
+        }
+      ],
+      "outputs": [
+        {
+          "name": "preprocessed_image",
+          "type": "IMAGE",
+          "links": [
+            14
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "vjumpkung/comfyui-pixal-3d-wrapper",
+        "ver": "e93da132c07bfb14abba316cbd2c2e701c64195f",
+        "Node name for S&R": "Pixal3DPreprocessImage"
+      },
+      "widgets_values": [
+        0,
+        "#000000"
+      ]
+    },
+    {
+      "id": 14,
+      "type": "Pixal3DBackgroundRemoverLoader",
+      "pos": [
+        61.99491890533883,
+        359.8241024470275
+      ],
+      "size": [
+        345.91171875,
+        130
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "rembg_model",
+          "type": "PIXAL3D_REMBG_MODEL",
+          "links": [
+            15
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "vjumpkung/comfyui-pixal-3d-wrapper",
+        "ver": "e93da132c07bfb14abba316cbd2c2e701c64195f",
+        "Node name for S&R": "Pixal3DBackgroundRemoverLoader"
+      },
+      "widgets_values": [
+        "ZhengPeng7/BiRefNet",
+        "cuda",
+        true,
+        false
+      ]
+    },
+    {
+      "id": 3,
+      "type": "LoadImage",
+      "pos": [
+        104.58708548535269,
+        574.3444435938201
+      ],
+      "size": [
+        282.798828125,
+        314
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            13
+          ]
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.21.1",
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "example.png",
+        "image"
+      ]
+    },
+    {
+      "id": 1,
+      "type": "Pixal3DImageTo3D",
+      "pos": [
+        932.5030063525597,
+        200.83217372829378
+      ],
+      "size": [
+        273.322265625,
+        410
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "pixal3d_model",
+          "type": "PIXAL3D_MODEL",
+          "link": 11
+        },
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 14
+        },
+        {
+          "name": "sampler_settings",
+          "shape": 7,
+          "type": "PIXAL3D_SAMPLER_SETTINGS",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "model_3d",
+          "type": "FILE_3D_GLB",
+          "links": [
+            6
+          ]
+        },
+        {
+          "name": "camera_json",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "aux_id": "vjumpkung/comfyui-pixal-3d-wrapper",
+        "ver": "33c2bcd3c18a457d246cc8521a73a3c39f9c96d9",
+        "Node name for S&R": "Pixal3DImageTo3D"
+      },
+      "widgets_values": [
+        42,
+        "fixed",
+        "1024_cascade",
+        0,
+        1,
+        0,
+        512,
+        49152,
+        200000,
+        2048,
+        true,
+        1,
+        0,
+        true
+      ]
+    },
+    {
+      "id": 15,
+      "type": "MarkdownNote",
+      "pos": [
+        825.4767634676585,
+        669.9529340945335
+      ],
+      "size": [
+        380.5730507812501,
+        261.78687890624997
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": [
+        "# This Workflow is very experimental.\n\n## - Some settings might be not working.\n\n## - low_vram for cpu offloading\n\n## - First time loading is very slow because it's contain many parts\n\n## - Model is diffusers based and inference code is from source. "
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 12,
+      "type": "Pixal3DModelLoader",
+      "pos": [
+        484.4530426464293,
+        241.9945835602953
+      ],
+      "size": [
+        312.21875,
+        250
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "pixal3d_model",
+          "type": "PIXAL3D_MODEL",
+          "links": [
+            11
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "vjumpkung/comfyui-pixal-3d-wrapper",
+        "ver": "e93da132c07bfb14abba316cbd2c2e701c64195f",
+        "Node name for S&R": "Pixal3DModelLoader"
+      },
+      "widgets_values": [
+        "TencentARC/Pixal3D",
+        "Ruicheng/moge-2-vitl",
+        "cuda",
+        true,
+        true,
+        "flash_attn",
+        "flash_attn",
+        "torch",
+        false
+      ]
+    }
+  ],
+  "links": [
+    [
+      6,
+      1,
+      0,
+      7,
+      0,
+      "FILE_3D_GLB"
+    ],
+    [
+      11,
+      12,
+      0,
+      1,
+      0,
+      "PIXAL3D_MODEL"
+    ],
+    [
+      13,
+      3,
+      0,
+      13,
+      1,
+      "IMAGE"
+    ],
+    [
+      14,
+      13,
+      0,
+      1,
+      1,
+      "IMAGE"
+    ],
+    [
+      15,
+      14,
+      0,
+      13,
+      0,
+      "PIXAL3D_REMBG_MODEL"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.6809946320516379,
+      "offset": [
+        217.83099653016893,
+        -25.58434587658326
+      ]
+    },
+    "frontendVersion": "1.43.18",
+    "VHS_latentpreview": false,
+    "VHS_latentpreviewrate": 0,
+    "VHS_MetadataImage": true,
+    "VHS_KeepIntermediate": true
+  },
+  "version": 0.4
+}
