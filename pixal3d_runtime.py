@@ -3,6 +3,7 @@ import os
 import re
 import sys
 import threading
+import time
 import types
 from dataclasses import dataclass
 from io import BytesIO
@@ -115,6 +116,120 @@ _REMBG_CACHE: Dict[Tuple[str, str, str, bool], Pixal3DBackgroundRemoverContext] 
 _REMBG_CACHE_LOCK = threading.Lock()
 _HF_SNAPSHOT_CACHE: Dict[Tuple[str, Tuple[str, ...]], str] = {}
 _HF_SNAPSHOT_CACHE_LOCK = threading.Lock()
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _profile_load_enabled() -> bool:
+    return _env_flag("PIXAL3D_PROFILE_LOAD")
+
+
+def _sync_cuda_for_timing(device: Optional[str]) -> None:
+    if not device:
+        return
+    try:
+        torch_device = torch.device(device)
+    except (RuntimeError, TypeError, ValueError):
+        return
+    if torch_device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(torch_device)
+
+
+def _log_load_timing(
+    label: str,
+    started_at: float,
+    enabled: bool,
+    device: Optional[str] = None,
+) -> None:
+    if not enabled:
+        return
+    _sync_cuda_for_timing(device)
+    elapsed = time.perf_counter() - started_at
+    print(f"[Pixal3D] load: {label} took {elapsed:.2f}s")
+
+
+def _first_tensor_device(module: Any) -> Optional[torch.device]:
+    for accessor_name in ("parameters", "buffers"):
+        accessor = getattr(module, accessor_name, None)
+        if not callable(accessor):
+            continue
+        try:
+            for tensor in accessor():
+                return tensor.device
+        except Exception:
+            continue
+
+    try:
+        device = getattr(module, "device", None)
+    except Exception:
+        return None
+    if device is None:
+        return None
+    try:
+        return torch.device(device)
+    except (RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _first_floating_tensor_dtype(module: Any) -> torch.dtype:
+    for accessor_name in ("parameters", "buffers"):
+        accessor = getattr(module, accessor_name, None)
+        if not callable(accessor):
+            continue
+        try:
+            for tensor in accessor():
+                if tensor.is_floating_point():
+                    return tensor.dtype
+        except Exception:
+            continue
+    return torch.float32
+
+
+def _device_matches(actual: torch.device, expected: str) -> bool:
+    expected_device = torch.device(expected)
+    if actual.type != expected_device.type:
+        return False
+    if actual.type != "cuda" or expected_device.index is None:
+        return True
+    return actual.index == expected_device.index
+
+
+def _warn_if_not_on_device(label: str, module: Any, expected_device: str) -> None:
+    actual_device = _first_tensor_device(module)
+    if actual_device is None or _device_matches(actual_device, expected_device):
+        return
+    print(
+        "[Pixal3D] warning: expected "
+        f"{label} on {expected_device}, found {actual_device}. "
+        "This can add CPU/CUDA transfer time during generation."
+    )
+
+
+def _warn_nonresident_pipeline_models(
+    pipeline: Any,
+    moge_model: Any,
+    expected_device: str,
+) -> None:
+    for name, model in getattr(pipeline, "models", {}).items():
+        _warn_if_not_on_device(f"pipeline.models[{name!r}]", model, expected_device)
+
+    for attr in (
+        "image_cond_model_ss",
+        "image_cond_model_shape_512",
+        "image_cond_model_shape_1024",
+        "image_cond_model_tex_1024",
+    ):
+        model = getattr(pipeline, attr, None)
+        if model is None:
+            continue
+        _warn_if_not_on_device(f"pipeline.{attr}", model, expected_device)
+        naf_model = getattr(model, "naf_model", None)
+        if naf_model is not None:
+            _warn_if_not_on_device(f"pipeline.{attr}.naf_model", naf_model, expected_device)
+
+    _warn_if_not_on_device("MoGe model", moge_model, expected_device)
 
 
 def _path_exists(path: str) -> bool:
@@ -479,6 +594,7 @@ def _patch_naf_model_attention(naf_model: Any, naf_attention_backend: str) -> No
             return rearrange(out, "b h w n d -> b (n d) h w")
 
         selected_backend = getattr(self, "_pixal3d_naf_attention_backend", "auto")
+        # The torch fallback follows the tensor device; it is not a CPU-only path.
         if selected_backend == "torch" or (
             selected_backend in {"auto", "flex-fna"} and q.shape[-1] != v.shape[-1]
         ):
@@ -578,14 +694,38 @@ def _patch_rembg_cache_resolution() -> None:
     from pixal3d.pipelines import rembg
 
     original = getattr(rembg, "BiRefNet", None)
-    if original is None or getattr(original, "_pixal3d_cache_wrapped", False):
+    if original is None or getattr(original, "_pixal3d_dtype_safe", False):
         return
 
     class CachedBiRefNet(original):
         _pixal3d_cache_wrapped = True
+        _pixal3d_dtype_safe = True
 
         def __init__(self, model_name: str = "ZhengPeng7/BiRefNet"):
-            super().__init__(_resolve_hf_snapshot(model_name))
+            if getattr(original, "_pixal3d_cache_wrapped", False):
+                super().__init__(model_name)
+            else:
+                super().__init__(_resolve_hf_snapshot(model_name))
+
+        def __call__(self, image: Image.Image) -> Image.Image:
+            from torchvision import transforms
+
+            image_size = image.size
+            device = _first_tensor_device(self.model)
+            if device is None:
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            dtype = _first_floating_tensor_dtype(self.model)
+            input_images = self.transform_image(image).unsqueeze(0).to(
+                device=device,
+                dtype=dtype,
+            )
+            with torch.no_grad():
+                preds = self.model(input_images)[-1].sigmoid().float().cpu()
+            pred = preds[0].squeeze()
+            pred_pil = transforms.ToPILImage()(pred)
+            mask = pred_pil.resize(image_size)
+            image.putalpha(mask)
+            return image
 
     CachedBiRefNet.__name__ = original.__name__
     CachedBiRefNet.__qualname__ = original.__qualname__
@@ -632,7 +772,7 @@ def load_pixal3d_background_remover_context(
     pixal3d_root: Optional[str] = None,
     model_name: str = DEFAULT_REMBG_MODEL,
     device: str = "cuda",
-    low_vram: bool = True,
+    low_vram: bool = False,
     force_reload: bool = False,
 ) -> Pixal3DBackgroundRemoverContext:
     root = resolve_pixal3d_root(pixal3d_root)
@@ -645,12 +785,15 @@ def load_pixal3d_background_remover_context(
 
     require_cuda_device(device)
     key = (root, model_name.strip(), device.strip(), bool(low_vram))
+    profile_load = _profile_load_enabled()
 
     with _REMBG_CACHE_LOCK:
         if force_reload:
             _REMBG_CACHE.pop(key, None)
             torch.cuda.empty_cache()
         if key in _REMBG_CACHE:
+            if profile_load:
+                print("[Pixal3D] load: background remover cache hit")
             return _REMBG_CACHE[key]
 
         configure_pixal3d_source_path(root)
@@ -658,10 +801,14 @@ def load_pixal3d_background_remover_context(
 
         from pixal3d.pipelines import rembg
 
+        started_at = time.perf_counter()
         model = rembg.BiRefNet(model_name.strip())
         model.to(device)
         if low_vram:
             model.cpu()
+        _log_load_timing("background remover load", started_at, profile_load, device)
+        if not low_vram:
+            _warn_if_not_on_device("background remover", model, device.strip())
 
         context = Pixal3DBackgroundRemoverContext(
             root=root,
@@ -781,7 +928,7 @@ def load_pixal3d_context(
     model_path: str = DEFAULT_MODEL_PATH,
     moge_model_name: str = DEFAULT_MOGE_MODEL,
     device: str = "cuda",
-    low_vram: bool = True,
+    low_vram: bool = False,
     preload_naf: bool = True,
     attention_backend: Optional[str] = None,
     sparse_attention_backend: Optional[str] = None,
@@ -803,6 +950,7 @@ def load_pixal3d_context(
         attention_backend,
     )
     naf_attention_backend = normalize_naf_attention_backend(naf_attention_backend)
+    profile_load = _profile_load_enabled()
     key = (
         root,
         model_path.strip(),
@@ -824,6 +972,8 @@ def load_pixal3d_context(
                 context.attention_backend,
                 context.sparse_attention_backend,
             )
+            if profile_load:
+                print("[Pixal3D] load: Pixal3D context cache hit")
             return context
 
         configure_pixal3d_environment(root, attention_backend, sparse_attention_backend)
@@ -839,11 +989,15 @@ def load_pixal3d_context(
 
         _patch_rembg_cache_resolution()
 
+        started_at = time.perf_counter()
         resolved_model_path = _resolve_pixal3d_model_path(model_path.strip())
         pipeline = _load_pipeline_without_background_remover(
             Pixal3DImageTo3DPipeline,
             resolved_model_path,
         )
+        _log_load_timing("Pixal3D pipeline checkpoint load", started_at, profile_load)
+
+        started_at = time.perf_counter()
         pipeline.image_cond_model_ss = build_image_cond_model(
             IMAGE_COND_CONFIGS["ss"],
             naf_attention_backend,
@@ -860,13 +1014,20 @@ def load_pixal3d_context(
             IMAGE_COND_CONFIGS["tex_1024"],
             naf_attention_backend,
         )
+        _log_load_timing("image conditioning model construction", started_at, profile_load)
+
+        started_at = time.perf_counter()
         pipeline.low_vram = bool(low_vram)
         pipeline.to(torch.device(device))
         _move_image_cond_models(pipeline, device, bool(low_vram))
+        _log_load_timing("pipeline CUDA move", started_at, profile_load, device)
 
         if preload_naf:
+            started_at = time.perf_counter()
             _preload_naf_models(pipeline, device, bool(low_vram), naf_attention_backend)
+            _log_load_timing("NAF preload", started_at, profile_load, device)
 
+        started_at = time.perf_counter()
         resolved_moge_model_name = _resolve_hf_snapshot(moge_model_name.strip())
         try:
             moge_model = MoGeModel.from_pretrained(resolved_moge_model_name).to(device)
@@ -875,6 +1036,9 @@ def load_pixal3d_context(
                 raise
             moge_model = MoGeModel.from_pretrained(moge_model_name.strip()).to(device)
         moge_model.eval()
+        _log_load_timing("MoGe load", started_at, profile_load, device)
+        if not low_vram:
+            _warn_nonresident_pipeline_models(pipeline, moge_model, device.strip())
 
         context = Pixal3DContext(
             root=root,

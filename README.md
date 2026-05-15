@@ -18,7 +18,8 @@ loader does not require a separate `~/Documents/Pixal3D` path.
 2. Install this wrapper into `ComfyUI/custom_nodes/comfyui-pixal-3d-wrapper`.
 
 Pixal3D inference requires CUDA. The loader defaults to `device=cuda` and keeps
-models cached after the first load.
+models cached on CUDA after the first load. Enable `low_vram` only when you need
+CPU offload between stages; it reduces VRAM use but adds CPU/CUDA transfer time.
 
 On Windows, if NAF fails with `NATTEN was not built with libnatten`, keep the
 loader's `naf_attention_backend` at `auto` or select `torch`. The `torch`

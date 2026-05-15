@@ -74,7 +74,7 @@ class Pixal3DModelLoader:
                         "placeholder": "cuda",
                     },
                 ),
-                "low_vram": ("BOOLEAN", {"default": True}),
+                "low_vram": ("BOOLEAN", {"default": False}),
                 "preload_naf": ("BOOLEAN", {"default": True}),
                 "attention_backend": (
                     list(PIXAL3D_ATTENTION_BACKENDS),
@@ -142,7 +142,7 @@ class Pixal3DBackgroundRemoverLoader:
                         "placeholder": "cuda",
                     },
                 ),
-                "low_vram": ("BOOLEAN", {"default": True}),
+                "low_vram": ("BOOLEAN", {"default": False}),
                 "force_reload": ("BOOLEAN", {"default": False}),
             }
         }
