@@ -16,10 +16,11 @@ stack installed in the same Python environment that runs ComfyUI.
 
 - `__init__.py`: exports ComfyUI node mappings.
 - `nodes.py`: defines the ComfyUI nodes and UI-facing input/output contracts.
-- `pixal3d_runtime.py`: lazy model loading, model cache, Hugging Face
-  cache-first model resolution, NAF attention backend patching, image
-  conversion, optional background removal preprocessing, camera estimation,
-  Pixal3D pipeline execution, and in-memory GLB export.
+- `pixal3d_runtime.py`: lazy model loading, Pixal3D context cache, shared
+  DINO/NAF conditioning caches, Hugging Face cache-first model resolution, NAF
+  attention backend patching, image conversion, optional background removal
+  preprocessing, camera estimation, Pixal3D pipeline execution, and in-memory
+  GLB export.
 - `vendor/Pixal3D`: bundled upstream Pixal3D inference source, requirements,
   and license.
 - `requirements.txt`: helper dependency list for Pixal3D-side dependencies.
@@ -62,13 +63,19 @@ stack installed in the same Python environment that runs ComfyUI.
 - Hugging Face repo IDs should be resolved to local snapshots before upstream
   `from_pretrained` calls. Check the local cache first, including symlinked
   snapshot files; download only on cache miss or incomplete snapshot.
+- Image conditioning wrappers should share immutable heavyweight backbones where
+  safe: reuse one frozen DINOv3 model per resolved `model_name` while keeping
+  each wrapper's own `image_size`, `grid_resolution`, and `proj_grid`; reuse one
+  frozen NAF upsampler per device/backend across NAF-enabled conditioning
+  wrappers.
 - `low_vram=False` is the fast path and keeps Pixal3D stage models, DINO/NAF
   conditioning models, MoGe, and background remover on CUDA after load.
   `low_vram=True` is the conservative path and moves models to CUDA only when
   needed, then back to CPU.
-- Set `PIXAL3D_PROFILE_LOAD=1` to print cache hits and coarse load timings for
-  Pixal3D checkpoint load, image conditioning model construction, CUDA moves,
-  NAF preload, MoGe load, and background remover load.
+- Set `PIXAL3D_PROFILE_LOAD=1` to print cache hits and load timings for Hugging
+  Face snapshot resolution, Pixal3D checkpoint load, shared DINO load/cache
+  hits, per-conditioning wrapper construction, shared NAF load/cache hits, CUDA
+  moves, NAF preload, MoGe load, and background remover load.
 - The wrapper-side BiRefNet patch must keep background-remover inputs on the
   loaded model's device and floating dtype. This avoids float32 input vs fp16
   bias failures when the Hugging Face rembg model loads half-precision weights.
@@ -86,6 +93,9 @@ stack installed in the same Python environment that runs ComfyUI.
   NATTEN backends.
 - Full generation is serialized with the cached context lock to avoid concurrent
   mutation of shared model state.
+- Non-low-VRAM generation should reassert image-conditioning model residency on
+  the target CUDA device before use, since shared DINO/NAF instances may have
+  been moved by a separate low-VRAM context.
 
 ## Development Rules
 

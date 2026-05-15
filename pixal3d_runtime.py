@@ -116,6 +116,10 @@ _REMBG_CACHE: Dict[Tuple[str, str, str, bool], Pixal3DBackgroundRemoverContext] 
 _REMBG_CACHE_LOCK = threading.Lock()
 _HF_SNAPSHOT_CACHE: Dict[Tuple[str, Tuple[str, ...]], str] = {}
 _HF_SNAPSHOT_CACHE_LOCK = threading.Lock()
+_DINO_MODEL_CACHE: Dict[str, Any] = {}
+_DINO_MODEL_CACHE_LOCK = threading.RLock()
+_NAF_MODEL_CACHE: Dict[Tuple[str, str], Any] = {}
+_NAF_MODEL_CACHE_LOCK = threading.Lock()
 
 
 def _env_flag(name: str) -> bool:
@@ -279,9 +283,16 @@ def _resolve_hf_snapshot(
         return model_id
 
     cache_key = (model_id, tuple(sorted(required_files)))
+    profile_load = _profile_load_enabled()
+    started_at = time.perf_counter()
     with _HF_SNAPSHOT_CACHE_LOCK:
         cached = _HF_SNAPSHOT_CACHE.get(cache_key)
         if cached and _snapshot_has_files(cached, required_files):
+            _log_load_timing(
+                f"Hugging Face snapshot cache hit for {model_id}",
+                started_at,
+                profile_load,
+            )
             return cached
 
         snapshot_dir = None
@@ -314,6 +325,11 @@ def _resolve_hf_snapshot(
             )
 
         _HF_SNAPSHOT_CACHE[cache_key] = snapshot_dir
+        _log_load_timing(
+            f"Hugging Face snapshot resolution for {model_id}",
+            started_at,
+            profile_load,
+        )
         return snapshot_dir
 
 
@@ -646,6 +662,94 @@ def _patch_naf_model_attention(naf_model: Any, naf_attention_backend: str) -> No
     upsampler._pixal3d_attention_patched = True
 
 
+def _load_shared_dinov3_model(model_name: str, profile_load: bool) -> Any:
+    with _DINO_MODEL_CACHE_LOCK:
+        cached = _DINO_MODEL_CACHE.get(model_name)
+        started_at = time.perf_counter()
+        if cached is not None:
+            _log_load_timing(
+                f"DINO shared cache hit for {model_name}",
+                started_at,
+                profile_load,
+            )
+            return cached
+
+        from pixal3d.trainers.flow_matching.mixins import image_conditioned_proj
+
+        model = image_conditioned_proj.DINOv3ViTModel.from_pretrained(model_name)
+        model.eval()
+        model.requires_grad_(False)
+        _DINO_MODEL_CACHE[model_name] = model
+        _log_load_timing(
+            f"DINO shared load for {model_name}",
+            started_at,
+            profile_load,
+        )
+        return model
+
+
+def _device_cache_key(device: Any) -> str:
+    try:
+        return str(torch.device(device))
+    except (RuntimeError, TypeError, ValueError):
+        return str(device)
+
+
+def _load_shared_naf_model(
+    device: Any,
+    naf_attention_backend: str,
+    profile_load: bool,
+) -> Any:
+    backend = normalize_naf_attention_backend(naf_attention_backend)
+    device_key = _device_cache_key(device)
+    target_device = torch.device(device)
+    key = (device_key, backend)
+
+    with _NAF_MODEL_CACHE_LOCK:
+        cached = _NAF_MODEL_CACHE.get(key)
+        started_at = time.perf_counter()
+        if cached is not None:
+            _log_load_timing(
+                f"NAF shared cache hit for {device_key}/{backend}",
+                started_at,
+                profile_load,
+                device_key,
+            )
+            actual_device = _first_tensor_device(cached)
+            if actual_device is not None and not _device_matches(actual_device, device_key):
+                move_started_at = time.perf_counter()
+                cached.to(target_device)
+                move_label = (
+                    "NAF shared CUDA move"
+                    if target_device.type == "cuda"
+                    else "NAF shared device move"
+                )
+                _log_load_timing(move_label, move_started_at, profile_load, device_key)
+            _patch_naf_model_attention(cached, backend)
+            return cached
+
+        from torch import hub as torch_hub
+
+        naf_model = torch_hub.load(
+            "valeoai/NAF",
+            "naf",
+            pretrained=True,
+            device=target_device,
+            trust_repo=True,
+        )
+        naf_model.eval()
+        naf_model.requires_grad_(False)
+        _patch_naf_model_attention(naf_model, backend)
+        _NAF_MODEL_CACHE[key] = naf_model
+        _log_load_timing(
+            f"NAF shared load for {device_key}/{backend}",
+            started_at,
+            profile_load,
+            device_key,
+        )
+        return naf_model
+
+
 def _configure_image_cond_naf_attention(model: Any, naf_attention_backend: str) -> None:
     backend = normalize_naf_attention_backend(naf_attention_backend)
     model._pixal3d_naf_attention_backend = backend
@@ -658,13 +762,21 @@ def _configure_image_cond_naf_attention(model: Any, naf_attention_backend: str) 
     original_load_naf = model._load_naf
 
     def load_naf_with_backend(*args, **kwargs):
-        result = original_load_naf(*args, **kwargs)
+        dino_model = getattr(model, "model", None)
+        device = _first_tensor_device(dino_model) if dino_model is not None else None
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model.naf_model = _load_shared_naf_model(
+            device,
+            getattr(model, "_pixal3d_naf_attention_backend", "auto"),
+            _profile_load_enabled(),
+        )
         if getattr(model, "naf_model", None) is not None:
             _patch_naf_model_attention(
                 model.naf_model,
                 getattr(model, "_pixal3d_naf_attention_backend", "auto"),
             )
-        return result
+        return None
 
     model._pixal3d_original_load_naf = original_load_naf
     model._load_naf = load_naf_with_backend
@@ -673,17 +785,58 @@ def _configure_image_cond_naf_attention(model: Any, naf_attention_backend: str) 
         _patch_naf_model_attention(model.naf_model, backend)
 
 
-def build_image_cond_model(config: Dict[str, Any], naf_attention_backend: str) -> Any:
-    from pixal3d.trainers.flow_matching.mixins.image_conditioned_proj import (
-        DinoV3ProjFeatureExtractor,
-    )
+def build_image_cond_model(
+    config: Dict[str, Any],
+    naf_attention_backend: str,
+    profile_load: bool = False,
+    label: str = "image conditioning",
+) -> Any:
+    from pixal3d.trainers.flow_matching.mixins import image_conditioned_proj
 
     resolved_config = dict(config)
     model_name = resolved_config.get("model_name")
+    shared_model = None
     if isinstance(model_name, str):
+        started_at = time.perf_counter()
         resolved_config["model_name"] = _resolve_hf_snapshot(model_name)
+        _log_load_timing(
+            f"{label} DINO snapshot resolution",
+            started_at,
+            profile_load,
+        )
+        shared_model = _load_shared_dinov3_model(
+            resolved_config["model_name"],
+            profile_load,
+        )
 
-    model = DinoV3ProjFeatureExtractor(**resolved_config)
+    started_at = time.perf_counter()
+    if shared_model is None:
+        model = image_conditioned_proj.DinoV3ProjFeatureExtractor(**resolved_config)
+    else:
+        with _DINO_MODEL_CACHE_LOCK:
+            original_dinov3_cls = image_conditioned_proj.DINOv3ViTModel
+
+            def from_pretrained_cached(requested_model_name, *args, **kwargs):
+                if str(requested_model_name) == str(resolved_config["model_name"]):
+                    return shared_model
+                return original_dinov3_cls.from_pretrained(
+                    requested_model_name,
+                    *args,
+                    **kwargs,
+                )
+
+            image_conditioned_proj.DINOv3ViTModel = types.SimpleNamespace(
+                from_pretrained=from_pretrained_cached
+            )
+            try:
+                model = image_conditioned_proj.DinoV3ProjFeatureExtractor(**resolved_config)
+            finally:
+                image_conditioned_proj.DINOv3ViTModel = original_dinov3_cls
+    _log_load_timing(
+        f"{label} wrapper construction",
+        started_at,
+        profile_load,
+    )
     if getattr(model, "use_naf_upsample", False):
         _configure_image_cond_naf_attention(model, naf_attention_backend)
     model.eval()
@@ -991,6 +1144,9 @@ def load_pixal3d_context(
 
         started_at = time.perf_counter()
         resolved_model_path = _resolve_pixal3d_model_path(model_path.strip())
+        _log_load_timing("Pixal3D model snapshot resolution", started_at, profile_load)
+
+        started_at = time.perf_counter()
         pipeline = _load_pipeline_without_background_remover(
             Pixal3DImageTo3DPipeline,
             resolved_model_path,
@@ -1001,18 +1157,26 @@ def load_pixal3d_context(
         pipeline.image_cond_model_ss = build_image_cond_model(
             IMAGE_COND_CONFIGS["ss"],
             naf_attention_backend,
+            profile_load,
+            "ss image conditioning",
         )
         pipeline.image_cond_model_shape_512 = build_image_cond_model(
             IMAGE_COND_CONFIGS["shape_512"],
             naf_attention_backend,
+            profile_load,
+            "shape_512 image conditioning",
         )
         pipeline.image_cond_model_shape_1024 = build_image_cond_model(
             IMAGE_COND_CONFIGS["shape_1024"],
             naf_attention_backend,
+            profile_load,
+            "shape_1024 image conditioning",
         )
         pipeline.image_cond_model_tex_1024 = build_image_cond_model(
             IMAGE_COND_CONFIGS["tex_1024"],
             naf_attention_backend,
+            profile_load,
+            "tex_1024 image conditioning",
         )
         _log_load_timing("image conditioning model construction", started_at, profile_load)
 
@@ -1029,6 +1193,9 @@ def load_pixal3d_context(
 
         started_at = time.perf_counter()
         resolved_moge_model_name = _resolve_hf_snapshot(moge_model_name.strip())
+        _log_load_timing("MoGe snapshot resolution", started_at, profile_load)
+
+        started_at = time.perf_counter()
         try:
             moge_model = MoGeModel.from_pretrained(resolved_moge_model_name).to(device)
         except Exception:
@@ -1278,6 +1445,8 @@ def run_pixal3d_to_3d(
             context.sparse_attention_backend,
         )
         torch.manual_seed(int(seed))
+        if not context.low_vram:
+            _move_image_cond_models(pipeline, context.device, False)
 
         image_for_generation = image.convert("RGB")
 
