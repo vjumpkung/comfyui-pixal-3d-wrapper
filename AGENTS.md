@@ -63,6 +63,9 @@ stack installed in the same Python environment that runs ComfyUI.
 - Hugging Face repo IDs should be resolved to local snapshots before upstream
   `from_pretrained` calls. Check the local cache first, including symlinked
   snapshot files; download only on cache miss or incomplete snapshot.
+- MoGe should resolve Hugging Face repo IDs to the cached `model.pt` file before
+  calling `MoGeModel.from_pretrained`, because MoGe accepts a checkpoint file
+  path and may otherwise perform its own Hub `HEAD` request.
 - Image conditioning wrappers should share immutable heavyweight backbones where
   safe: reuse one frozen DINOv3 model per resolved `model_name` while keeping
   each wrapper's own `image_size`, `grid_resolution`, and `proj_grid`; reuse one
@@ -76,6 +79,8 @@ stack installed in the same Python environment that runs ComfyUI.
   Face snapshot resolution, Pixal3D checkpoint load, shared DINO load/cache
   hits, per-conditioning wrapper construction, shared NAF load/cache hits, CUDA
   moves, NAF preload, MoGe load, and background remover load.
+- Set `PIXAL3D_LOAD_PROGRESS=1` to show a tqdm stage progress bar for Pixal3D
+  model loading. `PIXAL3D_PROFILE_LOAD=1` also enables this progress bar.
 - The wrapper-side BiRefNet patch must keep background-remover inputs on the
   loaded model's device and floating dtype. This avoids float32 input vs fp16
   bias failures when the Hugging Face rembg model loads half-precision weights.

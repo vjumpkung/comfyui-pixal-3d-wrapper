@@ -44,6 +44,21 @@ The bundled Pixal3D source path is resolved relative to this wrapper. If you nee
 to test a different Pixal3D checkout, set `PIXAL3D_ROOT` in the environment
 before starting ComfyUI.
 
+## Debugging Load
+
+To print cache hits and model-load timings, start ComfyUI with:
+
+```bash
+PIXAL3D_PROFILE_LOAD=1 python main.py
+```
+
+This also enables a tqdm stage progress bar for Pixal3D model loading. To show
+only the progress bar without timing logs, use:
+
+```bash
+PIXAL3D_LOAD_PROGRESS=1 python main.py
+```
+
 ## Basic Workflow
 
 1. Add **Pixal3D Model Loader**.

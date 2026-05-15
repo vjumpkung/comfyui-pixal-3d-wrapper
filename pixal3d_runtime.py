@@ -130,6 +130,10 @@ def _profile_load_enabled() -> bool:
     return _env_flag("PIXAL3D_PROFILE_LOAD")
 
 
+def _load_progress_enabled() -> bool:
+    return _env_flag("PIXAL3D_LOAD_PROGRESS") or _profile_load_enabled()
+
+
 def _sync_cuda_for_timing(device: Optional[str]) -> None:
     if not device:
         return
@@ -152,6 +156,45 @@ def _log_load_timing(
     _sync_cuda_for_timing(device)
     elapsed = time.perf_counter() - started_at
     print(f"[Pixal3D] load: {label} took {elapsed:.2f}s")
+
+
+class _LoadProgress:
+    def __init__(self, label: str, total: int, enabled: bool):
+        self.label = label
+        self.total = total
+        self.enabled = enabled
+        self._bar = None
+
+    def __enter__(self) -> "_LoadProgress":
+        if not self.enabled:
+            return self
+        try:
+            from tqdm.auto import tqdm
+        except Exception:
+            return self
+        self._bar = tqdm(
+            total=self.total,
+            desc=self.label,
+            unit="stage",
+            dynamic_ncols=True,
+            leave=True,
+        )
+        return self
+
+    def __exit__(self, _exc_type: Any, _exc: Any, _tb: Any) -> None:
+        if self._bar is not None:
+            self._bar.close()
+
+    def step(self, label: str) -> None:
+        if self._bar is not None:
+            self._bar.set_description_str(f"{self.label}: {label}")
+
+    def advance(self, label: Optional[str] = None) -> None:
+        if self._bar is None:
+            return
+        if label:
+            self._bar.set_postfix_str(label)
+        self._bar.update(1)
 
 
 def _first_tensor_device(module: Any) -> Optional[torch.device]:
@@ -252,6 +295,45 @@ def _snapshot_has_files(snapshot_dir: str, filenames: Tuple[str, ...]) -> bool:
     return all((root / filename).is_file() for filename in filenames)
 
 
+def _hf_cache_root() -> Path:
+    try:
+        from huggingface_hub.constants import HF_HUB_CACHE
+
+        return Path(HF_HUB_CACHE)
+    except Exception:
+        configured = os.environ.get("HUGGINGFACE_HUB_CACHE")
+        if configured:
+            return Path(os.path.expanduser(configured))
+        hf_home = os.environ.get("HF_HOME")
+        if hf_home:
+            return Path(os.path.expanduser(hf_home)) / "hub"
+        return Path.home() / ".cache" / "huggingface" / "hub"
+
+
+def _hf_repo_cache_dir(repo_id: str) -> Path:
+    return _hf_cache_root() / f"models--{repo_id.replace('/', '--')}"
+
+
+def _scan_cached_snapshot_file(repo_id: str, filename: str) -> Optional[str]:
+    repo_cache = _hf_repo_cache_dir(repo_id)
+    snapshots_dir = repo_cache / "snapshots"
+    if not snapshots_dir.is_dir():
+        return None
+
+    candidates = []
+    for snapshot_dir in snapshots_dir.iterdir():
+        if not snapshot_dir.is_dir():
+            continue
+        candidate = snapshot_dir / filename
+        if candidate.is_file():
+            candidates.append(candidate)
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    return str(candidates[0])
+
+
 def _cached_snapshot_from_file(repo_id: str, filename: str) -> Optional[str]:
     try:
         from huggingface_hub import try_to_load_from_cache
@@ -262,7 +344,9 @@ def _cached_snapshot_from_file(repo_id: str, filename: str) -> Optional[str]:
 
     cached = try_to_load_from_cache(repo_id, filename)
     if not isinstance(cached, str):
-        return None
+        cached = _scan_cached_snapshot_file(repo_id, filename)
+        if cached is None:
+            return None
 
     file_path = Path(cached)
     if not file_path.is_file():
@@ -270,6 +354,64 @@ def _cached_snapshot_from_file(repo_id: str, filename: str) -> Optional[str]:
 
     filename_depth = len(Path(filename).parts)
     return str(file_path.parents[filename_depth - 1])
+
+
+def _cached_hf_file(repo_id: str, filename: str) -> Optional[str]:
+    try:
+        from huggingface_hub import try_to_load_from_cache
+    except ImportError as exc:
+        raise RuntimeError(
+            "huggingface_hub is required to load Pixal3D model repositories."
+        ) from exc
+
+    cached = try_to_load_from_cache(repo_id, filename)
+    if isinstance(cached, str) and Path(cached).is_file():
+        return cached
+    return _scan_cached_snapshot_file(repo_id, filename)
+
+
+def _resolve_hf_file(repo_id: str, filename: str) -> str:
+    source = repo_id.strip()
+    expanded = Path(os.path.expanduser(source))
+    if not _looks_like_hf_repo_id(source):
+        if expanded.is_dir():
+            candidate = expanded / filename
+            if candidate.is_file():
+                return str(candidate.resolve())
+            raise RuntimeError(f"Expected {filename} inside local model directory: {expanded}")
+        if expanded.exists():
+            return str(expanded.resolve())
+        return source
+
+    profile_load = _profile_load_enabled()
+    started_at = time.perf_counter()
+    cached = _cached_hf_file(source, filename)
+    if cached:
+        _log_load_timing(
+            f"Hugging Face file cache hit for {source}/{filename}",
+            started_at,
+            profile_load,
+        )
+        return cached
+
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as exc:
+        raise RuntimeError(
+            "huggingface_hub is required to load Pixal3D model repositories."
+        ) from exc
+
+    path = hf_hub_download(
+        repo_id=source,
+        filename=filename,
+        repo_type="model",
+    )
+    _log_load_timing(
+        f"Hugging Face file download for {source}/{filename}",
+        started_at,
+        profile_load,
+    )
+    return path
 
 
 def _resolve_hf_snapshot(
@@ -363,6 +505,10 @@ def _resolve_pixal3d_model_path(model_path: str) -> str:
     if not _snapshot_has_files(snapshot_dir, required_files):
         snapshot_dir = _resolve_hf_snapshot(source, required_files)
     return snapshot_dir
+
+
+def _resolve_moge_model_path(model_name: str) -> str:
+    return _resolve_hf_file(model_name, "model.pt")
 
 
 def resolve_pixal3d_root(pixal3d_root: Optional[str] = None) -> str:
@@ -1104,6 +1250,7 @@ def load_pixal3d_context(
     )
     naf_attention_backend = normalize_naf_attention_backend(naf_attention_backend)
     profile_load = _profile_load_enabled()
+    progress_load = _load_progress_enabled()
     key = (
         root,
         model_path.strip(),
@@ -1142,68 +1289,88 @@ def load_pixal3d_context(
 
         _patch_rembg_cache_resolution()
 
-        started_at = time.perf_counter()
-        resolved_model_path = _resolve_pixal3d_model_path(model_path.strip())
-        _log_load_timing("Pixal3D model snapshot resolution", started_at, profile_load)
-
-        started_at = time.perf_counter()
-        pipeline = _load_pipeline_without_background_remover(
-            Pixal3DImageTo3DPipeline,
-            resolved_model_path,
-        )
-        _log_load_timing("Pixal3D pipeline checkpoint load", started_at, profile_load)
-
-        started_at = time.perf_counter()
-        pipeline.image_cond_model_ss = build_image_cond_model(
-            IMAGE_COND_CONFIGS["ss"],
-            naf_attention_backend,
-            profile_load,
-            "ss image conditioning",
-        )
-        pipeline.image_cond_model_shape_512 = build_image_cond_model(
-            IMAGE_COND_CONFIGS["shape_512"],
-            naf_attention_backend,
-            profile_load,
-            "shape_512 image conditioning",
-        )
-        pipeline.image_cond_model_shape_1024 = build_image_cond_model(
-            IMAGE_COND_CONFIGS["shape_1024"],
-            naf_attention_backend,
-            profile_load,
-            "shape_1024 image conditioning",
-        )
-        pipeline.image_cond_model_tex_1024 = build_image_cond_model(
-            IMAGE_COND_CONFIGS["tex_1024"],
-            naf_attention_backend,
-            profile_load,
-            "tex_1024 image conditioning",
-        )
-        _log_load_timing("image conditioning model construction", started_at, profile_load)
-
-        started_at = time.perf_counter()
-        pipeline.low_vram = bool(low_vram)
-        pipeline.to(torch.device(device))
-        _move_image_cond_models(pipeline, device, bool(low_vram))
-        _log_load_timing("pipeline CUDA move", started_at, profile_load, device)
-
-        if preload_naf:
+        progress_total = 9 + int(bool(preload_naf))
+        with _LoadProgress("Pixal3D model load", progress_total, progress_load) as progress:
+            progress.step("resolving Pixal3D checkpoint")
             started_at = time.perf_counter()
-            _preload_naf_models(pipeline, device, bool(low_vram), naf_attention_backend)
-            _log_load_timing("NAF preload", started_at, profile_load, device)
+            resolved_model_path = _resolve_pixal3d_model_path(model_path.strip())
+            _log_load_timing("Pixal3D model snapshot resolution", started_at, profile_load)
+            progress.advance("Pixal3D checkpoint resolved")
 
-        started_at = time.perf_counter()
-        resolved_moge_model_name = _resolve_hf_snapshot(moge_model_name.strip())
-        _log_load_timing("MoGe snapshot resolution", started_at, profile_load)
+            progress.step("loading Pixal3D checkpoint")
+            started_at = time.perf_counter()
+            pipeline = _load_pipeline_without_background_remover(
+                Pixal3DImageTo3DPipeline,
+                resolved_model_path,
+            )
+            _log_load_timing("Pixal3D pipeline checkpoint load", started_at, profile_load)
+            progress.advance("Pixal3D checkpoint loaded")
 
-        started_at = time.perf_counter()
-        try:
+            started_at = time.perf_counter()
+            progress.step("building sparse-structure conditioning")
+            pipeline.image_cond_model_ss = build_image_cond_model(
+                IMAGE_COND_CONFIGS["ss"],
+                naf_attention_backend,
+                profile_load,
+                "ss image conditioning",
+            )
+            progress.advance("sparse-structure conditioning ready")
+
+            progress.step("building shape_512 conditioning")
+            pipeline.image_cond_model_shape_512 = build_image_cond_model(
+                IMAGE_COND_CONFIGS["shape_512"],
+                naf_attention_backend,
+                profile_load,
+                "shape_512 image conditioning",
+            )
+            progress.advance("shape_512 conditioning ready")
+
+            progress.step("building shape_1024 conditioning")
+            pipeline.image_cond_model_shape_1024 = build_image_cond_model(
+                IMAGE_COND_CONFIGS["shape_1024"],
+                naf_attention_backend,
+                profile_load,
+                "shape_1024 image conditioning",
+            )
+            progress.advance("shape_1024 conditioning ready")
+
+            progress.step("building texture conditioning")
+            pipeline.image_cond_model_tex_1024 = build_image_cond_model(
+                IMAGE_COND_CONFIGS["tex_1024"],
+                naf_attention_backend,
+                profile_load,
+                "tex_1024 image conditioning",
+            )
+            _log_load_timing("image conditioning model construction", started_at, profile_load)
+            progress.advance("texture conditioning ready")
+
+            progress.step("moving Pixal3D pipeline to device")
+            started_at = time.perf_counter()
+            pipeline.low_vram = bool(low_vram)
+            pipeline.to(torch.device(device))
+            _move_image_cond_models(pipeline, device, bool(low_vram))
+            _log_load_timing("pipeline CUDA move", started_at, profile_load, device)
+            progress.advance("Pixal3D pipeline moved")
+
+            if preload_naf:
+                progress.step("preloading shared NAF")
+                started_at = time.perf_counter()
+                _preload_naf_models(pipeline, device, bool(low_vram), naf_attention_backend)
+                _log_load_timing("NAF preload", started_at, profile_load, device)
+                progress.advance("NAF ready")
+
+            progress.step("resolving MoGe checkpoint")
+            started_at = time.perf_counter()
+            resolved_moge_model_name = _resolve_moge_model_path(moge_model_name.strip())
+            _log_load_timing("MoGe checkpoint resolution", started_at, profile_load)
+            progress.advance("MoGe checkpoint resolved")
+
+            progress.step("loading MoGe")
+            started_at = time.perf_counter()
             moge_model = MoGeModel.from_pretrained(resolved_moge_model_name).to(device)
-        except Exception:
-            if resolved_moge_model_name == moge_model_name.strip():
-                raise
-            moge_model = MoGeModel.from_pretrained(moge_model_name.strip()).to(device)
-        moge_model.eval()
-        _log_load_timing("MoGe load", started_at, profile_load, device)
+            moge_model.eval()
+            _log_load_timing("MoGe load", started_at, profile_load, device)
+            progress.advance("MoGe loaded")
         if not low_vram:
             _warn_nonresident_pipeline_models(pipeline, moge_model, device.strip())
 
