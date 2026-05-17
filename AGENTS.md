@@ -22,6 +22,12 @@ stack installed in the same Python environment that runs ComfyUI.
   resolution, Pixal3D source/environment setup, DINO/NAF conditioning,
   preprocessing, model loading, image conversion, camera/sampler helpers,
   pipeline execution, and in-memory GLB export.
+- `runtime/_compat/`: wrapper-owned, transformers>=5 compatible vendored
+  copies of the two upstream Pixal3D modules that touch unstable DINOv3
+  private APIs (`pixal3d.modules.image_feature_extractor` and
+  `pixal3d.trainers.flow_matching.mixins.image_conditioned_proj`). The
+  inference subset only — `DinoV3VaeProjFeatureExtractor` and
+  `ImageConditionedProjMixin` are intentionally omitted.
 - `requirements.txt`: helper dependency list for Pixal3D-side dependencies.
 - `README.md`: user setup and workflow notes.
 
@@ -119,12 +125,20 @@ stack installed in the same Python environment that runs ComfyUI.
 - Return outputs with `io.NodeOutput`.
 - Avoid eager imports of Pixal3D, MoGe, `o_voxel`, or other heavy dependencies
   at module import time.
-- Do not reintroduce bundled Pixal3D source into this repository. Prefer
-  wrapper-side compatibility code in the focused `runtime/` modules and keep
-  `pixal3d_runtime.py` as the public re-export facade.
-- Wrapper-side DINOv3 compatibility code supports transformer layer layouts from
-  both older and newer `transformers` versions. Preserve that compatibility if
-  touching DINOv3 feature extraction.
+- Do not reintroduce bundled Pixal3D source into this repository beyond the
+  narrow `runtime/_compat/` shim layer. New compat shims are allowed only
+  when an upstream module touches unstable private transformers APIs (or
+  similar version-fragile surfaces) that the wrapper cannot otherwise
+  patch from outside. Keep `pixal3d_runtime.py` as the public re-export
+  facade and prefer wrapper-side adapters under `runtime/` over vendoring.
+- `runtime/_compat/install()` injects vendored modules into `sys.modules`
+  under their upstream dotted names before any `pixal3d.*` import. It runs
+  from `configure_pixal3d_environment()` in `runtime/attention.py`. Anything
+  that imports from upstream Pixal3D MUST go through that chokepoint first.
+- Wrapper-owned DINOv3 feature extraction (`runtime/_compat/_dinov3.py`)
+  resolves the encoder layer container (`model.layer` vs `model.encoder.layer`
+  vs `model.layers`, etc.) dynamically and unwraps tuple outputs. Preserve
+  that compatibility if touching DINOv3 feature extraction.
 - Do not run full Pixal3D inference unless the active environment has CUDA and
   the Pixal3D dependency stack installed.
 

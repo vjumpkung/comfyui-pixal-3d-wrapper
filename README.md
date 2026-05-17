@@ -65,6 +65,15 @@ Automatic source clone can be controlled with:
 Runtime implementation is split under `runtime/` by responsibility.
 `pixal3d_runtime.py` remains as the public facade imported by the ComfyUI nodes.
 
+Two upstream Pixal3D modules that use unstable transformers DINOv3 private
+APIs (`pixal3d.modules.image_feature_extractor` and
+`pixal3d.trainers.flow_matching.mixins.image_conditioned_proj`) are vendored
+under `runtime/_compat/` with transformers >=5 fixes baked in. The wrapper
+injects these into `sys.modules` before upstream Pixal3D loads, so the rest
+of the inference path (sampler, sparse-voxel ops, decoders, mesh extraction)
+still comes from upstream while the version-fragile surface stays in this
+repo.
+
 **Pixal3D Preprocess Image** converts one ComfyUI `IMAGE` frame to PIL, runs the
 wrapper-owned BiRefNet background remover when the image has no useful alpha
 channel, crops around the alpha mask, composites over `background_color`, and

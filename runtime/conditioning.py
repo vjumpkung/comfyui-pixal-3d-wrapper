@@ -6,7 +6,6 @@ import types
 from typing import Any, Dict, Tuple
 
 import torch
-import torch.nn.functional as F
 
 from .attention import normalize_naf_attention_backend
 from .devices import _device_matches, _first_tensor_device
@@ -225,45 +224,6 @@ def _patch_naf_model_attention(naf_model: Any, naf_attention_backend: str) -> No
     upsampler._pixal3d_attention_patched = True
 
 
-def _dinov3_encoder_layers(model: Any) -> Any:
-    candidates = (
-        getattr(model, "layer", None),
-        getattr(getattr(model, "model", None), "layer", None),
-        getattr(getattr(model, "encoder", None), "layer", None),
-        getattr(model, "layers", None),
-        getattr(getattr(model, "model", None), "layers", None),
-        getattr(getattr(model, "encoder", None), "layers", None),
-    )
-    for layers in candidates:
-        if layers is not None:
-            return layers
-    raise AttributeError(
-        "DINOv3ViTModel encoder layers were not found. Expected one of "
-        "model.layer, model.model.layer, model.encoder.layer, or a layers alias."
-    )
-
-
-def _extract_dinov3_features(model: Any, image: torch.Tensor) -> torch.Tensor:
-    image = image.to(model.embeddings.patch_embeddings.weight.dtype)
-    hidden_states = model.embeddings(image, bool_masked_pos=None)
-    position_embeddings = model.rope_embeddings(image)
-
-    for layer_module in _dinov3_encoder_layers(model):
-        hidden_states = layer_module(
-            hidden_states,
-            position_embeddings=position_embeddings,
-        )
-        if isinstance(hidden_states, tuple):
-            hidden_states = hidden_states[0]
-
-    return F.layer_norm(hidden_states, hidden_states.shape[-1:])
-
-
-def _patch_dinov3_feature_extraction(image_conditioned_proj: Any) -> None:
-    image_conditioned_proj._dinov3_encoder_layers = _dinov3_encoder_layers
-    image_conditioned_proj._extract_dinov3_features = _extract_dinov3_features
-
-
 def _load_shared_dinov3_model(model_name: str, profile_load: bool) -> Any:
     with _DINO_MODEL_CACHE_LOCK:
         cached = _DINO_MODEL_CACHE.get(model_name)
@@ -276,9 +236,8 @@ def _load_shared_dinov3_model(model_name: str, profile_load: bool) -> Any:
             )
             return cached
 
-        from pixal3d.trainers.flow_matching.mixins import image_conditioned_proj
+        from ._compat import image_conditioned_proj
 
-        _patch_dinov3_feature_extraction(image_conditioned_proj)
         model = image_conditioned_proj.DINOv3ViTModel.from_pretrained(model_name)
         model.eval()
         model.requires_grad_(False)
@@ -396,9 +355,8 @@ def build_image_cond_model(
     profile_load: bool = False,
     label: str = "image conditioning",
 ) -> Any:
-    from pixal3d.trainers.flow_matching.mixins import image_conditioned_proj
+    from ._compat import image_conditioned_proj
 
-    _patch_dinov3_feature_extraction(image_conditioned_proj)
     resolved_config = dict(config)
     model_name = resolved_config.get("model_name")
     shared_model = None

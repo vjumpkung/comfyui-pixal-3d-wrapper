@@ -4,6 +4,7 @@ from typing import Optional
 
 import torch
 
+from . import _compat
 from .constants import (
     DEFAULT_ATTENTION_BACKEND,
     DEFAULT_SPARSE_ATTENTION_BACKEND,
@@ -75,6 +76,7 @@ def configure_pixal3d_environment(
     sparse_attention_backend: str,
 ) -> None:
     configure_pixal3d_source_path()
+    _compat.install()
     os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     apply_pixal3d_attention_backends(attention_backend, sparse_attention_backend)
