@@ -20,6 +20,41 @@ from ....utils import dist_utils
 from ....utils.dist_utils import read_file_dist
 
 
+def _dinov3_encoder_layers(model):
+    """Return DINOv3 transformer blocks across transformers layout changes."""
+    candidates = (
+        getattr(model, "layer", None),
+        getattr(getattr(model, "model", None), "layer", None),
+        getattr(getattr(model, "encoder", None), "layer", None),
+        getattr(model, "layers", None),
+        getattr(getattr(model, "model", None), "layers", None),
+        getattr(getattr(model, "encoder", None), "layers", None),
+    )
+    for layers in candidates:
+        if layers is not None:
+            return layers
+    raise AttributeError(
+        "DINOv3ViTModel encoder layers were not found. Expected one of "
+        "model.layer, model.model.layer, model.encoder.layer, or a layers alias."
+    )
+
+
+def _extract_dinov3_features(model, image: torch.Tensor) -> torch.Tensor:
+    image = image.to(model.embeddings.patch_embeddings.weight.dtype)
+    hidden_states = model.embeddings(image, bool_masked_pos=None)
+    position_embeddings = model.rope_embeddings(image)
+
+    for layer_module in _dinov3_encoder_layers(model):
+        hidden_states = layer_module(
+            hidden_states,
+            position_embeddings=position_embeddings,
+        )
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[0]
+
+    return F.layer_norm(hidden_states, hidden_states.shape[-1:])
+
+
 # =============================================================================
 # Projection Utilities
 # =============================================================================
@@ -449,17 +484,7 @@ class DinoV3ProjFeatureExtractor(nn.Module):
     
     def extract_features(self, image: torch.Tensor) -> torch.Tensor:
         """Extract features using DINOv3."""
-        image = image.to(self.model.embeddings.patch_embeddings.weight.dtype)
-        hidden_states = self.model.embeddings(image, bool_masked_pos=None)
-        position_embeddings = self.model.rope_embeddings(image)
-
-        for layer_module in self.model.layer:
-            hidden_states = layer_module(
-                hidden_states,
-                position_embeddings=position_embeddings,
-            )
-
-        return F.layer_norm(hidden_states, hidden_states.shape[-1:])
+        return _extract_dinov3_features(self.model, image)
     
     def forward(
         self,
@@ -710,15 +735,7 @@ class DinoV3VaeProjFeatureExtractor(nn.Module):
     
     def _extract_dino_features(self, image: torch.Tensor) -> torch.Tensor:
         """Extract DINOv3 features from normalized image."""
-        image = image.to(self.dino_model.embeddings.patch_embeddings.weight.dtype)
-        hidden_states = self.dino_model.embeddings(image, bool_masked_pos=None)
-        position_embeddings = self.dino_model.rope_embeddings(image)
-        for layer_module in self.dino_model.layer:
-            hidden_states = layer_module(
-                hidden_states,
-                position_embeddings=position_embeddings,
-            )
-        return F.layer_norm(hidden_states, hidden_states.shape[-1:])
+        return _extract_dinov3_features(self.dino_model, image)
     
     @torch.no_grad()
     def _extract_vae_latent(self, image: torch.Tensor) -> torch.Tensor:
