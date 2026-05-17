@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import sys
 import threading
-import types
 from typing import Tuple
 
 _INSTALL_LOCK = threading.Lock()
@@ -35,28 +34,18 @@ _TARGET_MODULES: Tuple[Tuple[str, str], ...] = (
 )
 
 
-def _ensure_namespace_package(dotted: str) -> None:
-    """Make sure each parent of ``dotted`` exists in ``sys.modules`` as a
-    namespace package, so attribute lookups (e.g. ``pixal3d.modules`` after a
-    submodule injection) resolve cleanly even if upstream hasn't loaded the
-    real parent yet.
-    """
-    parts = dotted.split(".")
-    for i in range(1, len(parts)):
-        parent = ".".join(parts[:i])
-        if parent in sys.modules:
-            continue
-        module = types.ModuleType(parent)
-        module.__path__ = []
-        sys.modules[parent] = module
-
-
 def install() -> None:
     """Inject vendored modules under their upstream dotted names.
 
-    Idempotent and thread-safe. Must run before the first ``import pixal3d``
-    in the process. Re-importing the wrapper modules after install() is a
-    no-op.
+    Idempotent and thread-safe. Must run *after* the upstream Pixal3D root has
+    been added to ``sys.path`` (so the real parent packages remain importable)
+    and *before* the first ``import pixal3d.<submodule>`` that would otherwise
+    load upstream's version of the targeted leaves. Python's import machinery
+    checks ``sys.modules`` for fully-qualified submodule names, so injecting
+    only the leaves is sufficient — the real parent packages still load
+    normally off ``sys.path``. Setting parent attributes is best-effort: if
+    the parent isn't loaded yet, Python's importer fills it in itself the
+    next time the submodule is fetched via ``from parent import leaf``.
     """
     global _INSTALLED
     with _INSTALL_LOCK:
@@ -70,7 +59,6 @@ def install() -> None:
             "image_conditioned_proj": _vendored_icp,
         }
         for upstream_name, local_name in _TARGET_MODULES:
-            _ensure_namespace_package(upstream_name)
             sys.modules[upstream_name] = local_modules[local_name]
             parent_name, _, attr = upstream_name.rpartition(".")
             parent = sys.modules.get(parent_name)
