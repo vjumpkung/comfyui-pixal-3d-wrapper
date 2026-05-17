@@ -1,9 +1,9 @@
 # ComfyUI Pixal3D Wrapper
 
 ComfyUI custom nodes for running Pixal3D image-to-3D generation. Pixal3D
-inference source is not bundled in this custom node; install it in the same
-Python environment as ComfyUI or point `PIXAL3D_SOURCE_PATH` at a local
-Pixal3D checkout.
+inference source is not bundled in this custom node. If Pixal3D is not already
+installed or pointed to by `PIXAL3D_SOURCE_PATH`, the loader clones
+`TencentARC/Pixal3D` into `.pixal3d_source/Pixal3D` on first use.
 
 ## Nodes
 
@@ -17,7 +17,7 @@ Pixal3D checkout.
 
 1. Install TRELLIS.2 and Pixal3D dependencies into the same Python environment used by ComfyUI.
 2. Install this wrapper into `ComfyUI/custom_nodes/comfyui-pixal-3d-wrapper`.
-3. If Pixal3D is a source checkout instead of an importable Python package, set `PIXAL3D_SOURCE_PATH` before starting ComfyUI.
+3. Optional: set `PIXAL3D_SOURCE_PATH` before starting ComfyUI if you want to use a specific local Pixal3D checkout.
 
 Pixal3D inference requires CUDA. The loader defaults to `device=cuda` and keeps
 models cached on CUDA after the first load. Enable `low_vram` only when you need
@@ -52,6 +52,13 @@ python main.py
 
 `PIXAL3D_SOURCE_PATH` can point either to a checkout containing
 `pixal3d/__init__.py` or directly to the `pixal3d` package directory.
+
+Automatic source clone can be controlled with:
+
+- `PIXAL3D_AUTO_CLONE=0`: disable auto-clone and require an installed package or `PIXAL3D_SOURCE_PATH`.
+- `PIXAL3D_SOURCE_CACHE=/path/to/cache`: change the clone cache directory.
+- `PIXAL3D_GIT_URL=https://...`: use a fork instead of `TencentARC/Pixal3D`.
+- `PIXAL3D_GIT_REF=branch-or-commit`: check out a specific ref after cloning.
 
 ## Runtime Flow
 

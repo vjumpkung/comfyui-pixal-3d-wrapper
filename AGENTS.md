@@ -5,10 +5,10 @@
 This repository is a ComfyUI custom-node wrapper for Pixal3D. It is intended to
 live under `ComfyUI/custom_nodes/comfyui-pixal-3d-wrapper`.
 
-Pixal3D inference source is not bundled. It must be importable in the Python
-environment that runs ComfyUI, or `PIXAL3D_SOURCE_PATH` must point to a local
-Pixal3D checkout containing `pixal3d/__init__.py`. The ComfyUI loader still does
-not expose a `pixal3d_root` input.
+Pixal3D inference source is not bundled. It may be importable in the Python
+environment that runs ComfyUI, supplied through `PIXAL3D_SOURCE_PATH`, or cloned
+automatically into `.pixal3d_source/Pixal3D` on first use. The ComfyUI loader
+still does not expose a `pixal3d_root` input.
 
 Pixal3D inference requires CUDA and the upstream Pixal3D/TRELLIS.2 dependency
 stack installed in the same Python environment that runs ComfyUI.
@@ -42,8 +42,9 @@ stack installed in the same Python environment that runs ComfyUI.
 
 - Keep heavyweight Pixal3D imports lazy. ComfyUI should be able to import this
   package without loading the model stack.
-- Pixal3D source is resolved lazily from the import environment or
-  `PIXAL3D_SOURCE_PATH`; do not import Pixal3D at package import time.
+- Pixal3D source is resolved lazily from the import environment,
+  `PIXAL3D_SOURCE_PATH`, or the auto-cloned `.pixal3d_source/Pixal3D` checkout;
+  do not import Pixal3D at package import time.
 - `Pixal3D Model Loader` intentionally does not expose `pixal3d_root`.
 - The Pixal3D model loader defaults exposed in ComfyUI are:
   - `model_path`: `TencentARC/Pixal3D`
@@ -59,6 +60,8 @@ stack installed in the same Python environment that runs ComfyUI.
   CPU offload.
 - Keep external Pixal3D source selection outside the node UI. `PIXAL3D_SOURCE_PATH`
   is the supported source-checkout hook for non-installed Pixal3D trees.
+  Auto-clone is controlled by `PIXAL3D_AUTO_CLONE`, `PIXAL3D_SOURCE_CACHE`,
+  `PIXAL3D_GIT_URL`, and `PIXAL3D_GIT_REF`.
 - Hugging Face repo IDs should be resolved to local snapshots before upstream
   `from_pretrained` calls. Check the local cache first, including symlinked
   snapshot files; download only on cache miss or incomplete snapshot.
