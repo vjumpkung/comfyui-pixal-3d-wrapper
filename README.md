@@ -36,10 +36,11 @@ follows the dense backend when sparse attention supports it and otherwise falls
 back to `sdpa`. If you install flash-attention or xformers, you can still
 explicitly select `flash_attn`, `flash_attn_3`, `flash_attn_4`, or `xformers`.
 
-Pixal3D also requires the upstream `utils3d` wheel:
+The wrapper's `requirements.txt` already lists `utils3d`; install it (and the
+other listed Pixal3D-side dependencies) into the same environment as ComfyUI:
 
 ```bash
-pip install utils3d
+pip install -r requirements.txt
 ```
 
 Example external source setup:
@@ -56,23 +57,20 @@ python main.py
 Automatic source clone can be controlled with:
 
 - `PIXAL3D_AUTO_CLONE=0`: disable auto-clone and require an installed package or `PIXAL3D_SOURCE_PATH`.
-- `PIXAL3D_SOURCE_CACHE=/path/to/cache`: change the clone cache directory.
+- `PIXAL3D_SOURCE_CACHE=/path/to/cache`: change the clone cache directory (defaults to `.pixal3d_source/` next to this node).
 - `PIXAL3D_GIT_URL=https://...`: use a fork instead of `TencentARC/Pixal3D`.
 - `PIXAL3D_GIT_REF=branch-or-commit`: check out a specific ref after cloning.
 
 ## Runtime Flow
 
 Runtime implementation is split under `runtime/` by responsibility.
-`pixal3d_runtime.py` remains as the public facade imported by the ComfyUI nodes.
+`pixal3d_runtime.py` is the public facade imported by the ComfyUI nodes.
 
-Two upstream Pixal3D modules that use unstable transformers DINOv3 private
-APIs (`pixal3d.modules.image_feature_extractor` and
-`pixal3d.trainers.flow_matching.mixins.image_conditioned_proj`) are vendored
-under `runtime/_compat/` with transformers >=5 fixes baked in. The wrapper
-injects these into `sys.modules` before upstream Pixal3D loads, so the rest
-of the inference path (sampler, sparse-voxel ops, decoders, mesh extraction)
-still comes from upstream while the version-fragile surface stays in this
-repo.
+The two upstream Pixal3D modules that touch unstable transformers DINOv3
+private APIs are vendored under `runtime/_compat/` with transformers >=5
+fixes baked in, and injected into `sys.modules` before upstream Pixal3D
+loads. The rest of the inference path (sampler, sparse-voxel ops, decoders,
+mesh extraction) still comes from upstream Pixal3D.
 
 **Pixal3D Preprocess Image** converts one ComfyUI `IMAGE` frame to PIL, runs the
 wrapper-owned BiRefNet background remover when the image has no useful alpha
@@ -80,15 +78,19 @@ channel, crops around the alpha mask, composites over `background_color`, and
 returns a ComfyUI `IMAGE`.
 
 **Pixal3D Image to 3D** converts one ComfyUI `IMAGE` frame to PIL, estimates
-camera parameters with MoGe, calls `Pixal3DImageTo3DPipeline.run` with
-`preprocess_image=False`, converts the first mesh to an in-memory GLB through
-`o_voxel.postprocess.to_glb`, and returns `FILE_3D_GLB` plus camera JSON.
+camera parameters with MoGe, runs the Pixal3D image-to-3D pipeline with
+`preprocess_image=False`, exports the first mesh as an in-memory GLB, and
+returns `FILE_3D_GLB` plus camera JSON. The node exposes the upstream
+`1024_cascade` and `1536_cascade` pipeline variants and forwards mesh,
+texture, remesh, and decimation knobs to the pipeline.
 
-## This Custom Nodes require like a TRELLIS.2 
+## TRELLIS.2 Dependency Stack
 
-- Prebuilt wheels for TRELLIS.2 can be used too.
-- Example Wheels : https://github.com/visualbruno/ComfyUI-Trellis2/tree/main/wheels
-- If you want to use it in runpod : https://console.runpod.io/deploy?template=o5gnyb1fzu&ref=6h6f9kga
+Pixal3D shares its inference stack with TRELLIS.2 (sparse-voxel ops, custom
+CUDA kernels). The same wheels work here.
+
+- Prebuilt wheels for TRELLIS.2: https://github.com/visualbruno/ComfyUI-Trellis2/tree/main/wheels
+- RunPod template: https://console.runpod.io/deploy?template=o5gnyb1fzu&ref=6h6f9kga
 
 ## Debugging Load
 
@@ -97,6 +99,14 @@ default. To silence them, start ComfyUI with:
 
 ```bash
 PIXAL3D_PROFILE_LOAD=0 PIXAL3D_LOAD_PROGRESS=0 python main.py
+```
+
+PowerShell equivalent:
+
+```powershell
+$env:PIXAL3D_PROFILE_LOAD = "0"
+$env:PIXAL3D_LOAD_PROGRESS = "0"
+python main.py
 ```
 
 ## Basic Workflow

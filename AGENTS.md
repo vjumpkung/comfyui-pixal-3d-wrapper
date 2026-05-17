@@ -8,7 +8,7 @@ live under `ComfyUI/custom_nodes/comfyui-pixal-3d-wrapper`.
 Pixal3D inference source is not bundled. It may be importable in the Python
 environment that runs ComfyUI, supplied through `PIXAL3D_SOURCE_PATH`, or cloned
 automatically into `.pixal3d_source/Pixal3D` on first use. The ComfyUI loader
-still does not expose a `pixal3d_root` input.
+does not expose a `pixal3d_root` input.
 
 Pixal3D inference requires CUDA and the upstream Pixal3D/TRELLIS.2 dependency
 stack installed in the same Python environment that runs ComfyUI.
@@ -25,9 +25,11 @@ stack installed in the same Python environment that runs ComfyUI.
 - `runtime/_compat/`: wrapper-owned, transformers>=5 compatible vendored
   copies of the two upstream Pixal3D modules that touch unstable DINOv3
   private APIs (`pixal3d.modules.image_feature_extractor` and
-  `pixal3d.trainers.flow_matching.mixins.image_conditioned_proj`). The
-  inference subset only — `DinoV3VaeProjFeatureExtractor` and
-  `ImageConditionedProjMixin` are intentionally omitted.
+  `pixal3d.trainers.flow_matching.mixins.image_conditioned_proj`). Inference
+  subset only — `DinoV3VaeProjFeatureExtractor` and `ImageConditionedProjMixin`
+  are intentionally omitted (training/Flux-VAE-only). DINOv3 encoder iteration
+  is centralized in `runtime/_compat/_dinov3.py` so both vendored modules share
+  one compat path.
 - `requirements.txt`: helper dependency list for Pixal3D-side dependencies.
 - `README.md`: user setup and workflow notes.
 
@@ -144,7 +146,9 @@ stack installed in the same Python environment that runs ComfyUI.
 
 ## Verification
 
-Run lightweight checks from the repo root:
+Run lightweight checks from the repo root.
+
+Syntax check (bash):
 
 ```bash
 python - <<'PY'
@@ -155,6 +159,19 @@ for path in ("__init__.py", "nodes.py", "pixal3d_runtime.py"):
 print("syntax ok")
 PY
 ```
+
+Syntax check (PowerShell):
+
+```powershell
+python -c @'
+from pathlib import Path
+for path in ("__init__.py", "nodes.py", "pixal3d_runtime.py"):
+    compile(Path(path).read_text(encoding="utf-8"), path, "exec")
+print("syntax ok")
+'@
+```
+
+Schema/import check (bash):
 
 ```bash
 PYTHONPATH=../.. python - <<'PY'
@@ -191,6 +208,10 @@ async def main():
 asyncio.run(main())
 PY
 ```
+
+The schema check requires ComfyUI on `PYTHONPATH` (it imports
+`comfy_api.latest`). On PowerShell, run the same script from a temp file with
+`$env:PYTHONPATH = "..\.."` first.
 
 Expected node keys:
 
