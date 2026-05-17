@@ -26,13 +26,14 @@ loader's `naf_attention_backend` at `auto` or select `torch`. The `torch`
 fallback is slower, but supports NAF's mismatched QK/V head dimensions when
 NATTEN Flex cannot.
 
-The loader's `attention_backend` controls Pixal3D dense attention and can be set
-to `flash_attn_3`, `flash_attn`, `sdpa`, `xformers`, `naive`, or
-`flash_attn_4`. `sparse_attention_backend` controls Pixal3D sparse attention;
-its `auto` default follows the dense backend when sparse attention supports it,
-otherwise it falls back to `flash_attn`. Sparse Pixal3D attention does not have
-an `sdpa` implementation, so use `flash_attn`, `flash_attn_3`, `flash_attn_4`,
-or `xformers` there.
+The loader's `attention_backend` controls Pixal3D dense attention and defaults
+to `sdpa`, which works without flash-attention installed. It can be set to
+`flash_attn_3`, `flash_attn`, `sdpa`, `xformers`, `naive`, or `flash_attn_4`.
+`sparse_attention_backend` controls Pixal3D sparse attention; its `auto` default
+follows the dense backend when sparse attention supports it, including the
+bundled Pixal3D `sdpa` sparse-attention path. If you install flash-attention or
+xformers, you can still explicitly select `flash_attn`, `flash_attn_3`,
+`flash_attn_4`, or `xformers`.
 
 Pixal3D also requires the upstream `utils3d` wheel:
 
@@ -40,9 +41,9 @@ Pixal3D also requires the upstream `utils3d` wheel:
 pip install utils3d
 ```
 
-The bundled Pixal3D source path is resolved relative to this wrapper. If you need
-to test a different Pixal3D checkout, set `PIXAL3D_ROOT` in the environment
-before starting ComfyUI.
+The Pixal3D source path is hardcoded to this wrapper's bundled
+`vendor/Pixal3D` copy. External Pixal3D checkout switching is intentionally
+unsupported.
 
 ## This Custom Nodes require like a TRELLIS.2 
 
@@ -52,17 +53,11 @@ before starting ComfyUI.
 
 ## Debugging Load
 
-To print cache hits and model-load timings, start ComfyUI with:
+Model-load cache hits, timings, and the tqdm stage progress bar are shown by
+default. To silence them, start ComfyUI with:
 
 ```bash
-PIXAL3D_PROFILE_LOAD=1 python main.py
-```
-
-This also enables a tqdm stage progress bar for Pixal3D model loading. To show
-only the progress bar without timing logs, use:
-
-```bash
-PIXAL3D_LOAD_PROGRESS=1 python main.py
+PIXAL3D_PROFILE_LOAD=0 PIXAL3D_LOAD_PROGRESS=0 python main.py
 ```
 
 ## Basic Workflow

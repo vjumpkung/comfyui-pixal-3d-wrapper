@@ -7,30 +7,6 @@ import numpy as np
 from PIL import Image
 
 
-def _get_dinov3_layers(model):
-    """Return DINOv3 transformer blocks for transformers v4 and v5 layouts."""
-    if hasattr(model, "layer"):
-        return model.layer
-    encoder = getattr(model, "model", None)
-    if encoder is not None and hasattr(encoder, "layer"):
-        return encoder.layer
-    raise AttributeError(
-        f"{model.__class__.__name__} does not expose DINOv3 layers as "
-        "'layer' or 'model.layer'."
-    )
-
-
-def _unwrap_hidden_states(output):
-    if isinstance(output, torch.Tensor):
-        return output
-    if isinstance(output, tuple):
-        return output[0]
-    last_hidden_state = getattr(output, "last_hidden_state", None)
-    if last_hidden_state is not None:
-        return last_hidden_state
-    raise TypeError(f"Unexpected DINOv3 layer output type: {type(output).__name__}")
-
-
 class DinoV2FeatureExtractor:
     """
     Feature extractor for DINOv2 models.
@@ -107,11 +83,11 @@ class DinoV3FeatureExtractor:
         hidden_states = self.model.embeddings(image, bool_masked_pos=None)
         position_embeddings = self.model.rope_embeddings(image)
 
-        for i, layer_module in enumerate(_get_dinov3_layers(self.model)):
-            hidden_states = _unwrap_hidden_states(layer_module(
+        for i, layer_module in enumerate(self.model.layer):
+            hidden_states = layer_module(
                 hidden_states,
                 position_embeddings=position_embeddings,
-            ))
+            )
 
         return F.layer_norm(hidden_states, hidden_states.shape[-1:])
         

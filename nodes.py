@@ -2,8 +2,10 @@ from io import BytesIO
 from typing import Any, Dict, Optional
 
 import torch
+from comfy_api.latest import ComfyExtension, Types, io
 
 from .pixal3d_runtime import (
+    DEFAULT_ATTENTION_BACKEND,
     DEFAULT_MODEL_PATH,
     DEFAULT_MOGE_MODEL,
     DEFAULT_REMBG_MODEL,
@@ -28,6 +30,11 @@ except ImportError:
     ProgressBar = None
 
 
+PIXAL3D_MODEL = io.Custom("PIXAL3D_MODEL")
+PIXAL3D_REMBG_MODEL = io.Custom("PIXAL3D_REMBG_MODEL")
+PIXAL3D_SAMPLER_SETTINGS = io.Custom("PIXAL3D_SAMPLER_SETTINGS")
+
+
 def _progress_callback() -> Any:
     if ProgressBar is None:
         return None
@@ -40,65 +47,56 @@ def _progress_callback() -> Any:
     return update
 
 
-def _glb_file_output(glb_data: bytes) -> Any:
-    try:
-        from comfy_api.latest import Types
-    except Exception:
-        return BytesIO(glb_data)
+def _glb_file_output(glb_data: bytes) -> Types.File3D:
     return Types.File3D(BytesIO(glb_data), "glb")
 
 
-class Pixal3DModelLoader:
+class Pixal3DModelLoader(io.ComfyNode):
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "model_path": (
-                    "STRING",
-                    {
-                        "default": DEFAULT_MODEL_PATH,
-                        "placeholder": "TencentARC/Pixal3D or local model folder",
-                    },
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="Pixal3DModelLoader",
+            display_name="Pixal3D Model Loader",
+            category="Pixal3D",
+            description="Load and cache the bundled Pixal3D pipeline, MoGe, and DINO/NAF conditioning models.",
+            inputs=[
+                io.String.Input(
+                    "model_path",
+                    default=DEFAULT_MODEL_PATH,
+                    placeholder="TencentARC/Pixal3D or local model folder",
                 ),
-                "moge_model_name": (
-                    "STRING",
-                    {
-                        "default": DEFAULT_MOGE_MODEL,
-                        "placeholder": "Ruicheng/moge-2-vitl",
-                    },
+                io.String.Input(
+                    "moge_model_name",
+                    default=DEFAULT_MOGE_MODEL,
+                    placeholder="Ruicheng/moge-2-vitl",
                 ),
-                "device": (
-                    "STRING",
-                    {
-                        "default": "cuda",
-                        "placeholder": "cuda",
-                    },
+                io.String.Input("device", default="cuda", placeholder="cuda"),
+                io.Boolean.Input("low_vram", default=False),
+                io.Boolean.Input("preload_naf", default=True),
+                io.Combo.Input(
+                    "attention_backend",
+                    options=list(PIXAL3D_ATTENTION_BACKENDS),
+                    default=DEFAULT_ATTENTION_BACKEND,
                 ),
-                "low_vram": ("BOOLEAN", {"default": False}),
-                "preload_naf": ("BOOLEAN", {"default": True}),
-                "attention_backend": (
-                    list(PIXAL3D_ATTENTION_BACKENDS),
-                    {"default": "flash_attn_3"},
+                io.Combo.Input(
+                    "sparse_attention_backend",
+                    options=list(PIXAL3D_SPARSE_ATTENTION_BACKENDS),
+                    default="auto",
                 ),
-                "sparse_attention_backend": (
-                    list(PIXAL3D_SPARSE_ATTENTION_BACKENDS),
-                    {"default": "auto"},
+                io.Combo.Input(
+                    "naf_attention_backend",
+                    options=list(NAF_ATTENTION_BACKENDS),
+                    default="auto",
                 ),
-                "naf_attention_backend": (
-                    list(NAF_ATTENTION_BACKENDS),
-                    {"default": "auto"},
-                ),
-                "force_reload": ("BOOLEAN", {"default": False}),
-            }
-        }
+                io.Boolean.Input("force_reload", default=False),
+            ],
+            outputs=[PIXAL3D_MODEL.Output("pixal3d_model")],
+            is_output_node=False,
+        )
 
-    RETURN_TYPES = ("PIXAL3D_MODEL",)
-    RETURN_NAMES = ("pixal3d_model",)
-    FUNCTION = "load"
-    CATEGORY = "Pixal3D"
-
-    def load(
-        self,
+    @classmethod
+    def execute(
+        cls,
         model_path: str,
         moge_model_name: str,
         device: str,
@@ -108,7 +106,7 @@ class Pixal3DModelLoader:
         sparse_attention_backend: str,
         naf_attention_backend: str,
         force_reload: bool,
-    ):
+    ) -> io.NodeOutput:
         context = load_pixal3d_context(
             model_path=model_path,
             moge_model_name=moge_model_name,
@@ -120,117 +118,101 @@ class Pixal3DModelLoader:
             naf_attention_backend=naf_attention_backend,
             force_reload=force_reload,
         )
-        return (context,)
+        return io.NodeOutput(context)
 
 
-class Pixal3DBackgroundRemoverLoader:
+class Pixal3DBackgroundRemoverLoader(io.ComfyNode):
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "model_name": (
-                    "STRING",
-                    {
-                        "default": DEFAULT_REMBG_MODEL,
-                        "placeholder": "ZhengPeng7/BiRefNet",
-                    },
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="Pixal3DBackgroundRemoverLoader",
+            display_name="Pixal3D Background Remover Loader",
+            category="Pixal3D",
+            description="Load and cache the optional Pixal3D background remover used by preprocessing.",
+            inputs=[
+                io.String.Input(
+                    "model_name",
+                    default=DEFAULT_REMBG_MODEL,
+                    placeholder="ZhengPeng7/BiRefNet",
                 ),
-                "device": (
-                    "STRING",
-                    {
-                        "default": "cuda",
-                        "placeholder": "cuda",
-                    },
-                ),
-                "low_vram": ("BOOLEAN", {"default": False}),
-                "force_reload": ("BOOLEAN", {"default": False}),
-            }
-        }
+                io.String.Input("device", default="cuda", placeholder="cuda"),
+                io.Boolean.Input("low_vram", default=False),
+                io.Boolean.Input("force_reload", default=False),
+            ],
+            outputs=[PIXAL3D_REMBG_MODEL.Output("rembg_model")],
+            is_output_node=False,
+        )
 
-    RETURN_TYPES = ("PIXAL3D_REMBG_MODEL",)
-    RETURN_NAMES = ("rembg_model",)
-    FUNCTION = "load"
-    CATEGORY = "Pixal3D"
-
-    def load(
-        self,
+    @classmethod
+    def execute(
+        cls,
         model_name: str,
         device: str,
         low_vram: bool,
         force_reload: bool,
-    ):
+    ) -> io.NodeOutput:
         context = load_pixal3d_background_remover_context(
             model_name=model_name,
             device=device,
             low_vram=low_vram,
             force_reload=force_reload,
         )
-        return (context,)
+        return io.NodeOutput(context)
 
 
-class Pixal3DSamplerSettings:
+class Pixal3DSamplerSettings(io.ComfyNode):
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "ss_guidance_strength": (
-                    "FLOAT",
-                    {"default": 7.5, "min": 0.0, "max": 30.0, "step": 0.1},
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="Pixal3DSamplerSettings",
+            display_name="Pixal3D Sampler Settings",
+            category="Pixal3D",
+            description="Override Pixal3D sampler parameters while keeping upstream defaults as the baseline.",
+            inputs=[
+                io.Float.Input("ss_guidance_strength", default=7.5, min=0.0, max=30.0, step=0.1),
+                io.Float.Input("ss_guidance_rescale", default=0.7, min=0.0, max=1.0, step=0.05),
+                io.Int.Input("ss_sampling_steps", default=12, min=1, max=100),
+                io.Float.Input("ss_rescale_t", default=5.0, min=0.0, max=20.0, step=0.1),
+                io.Float.Input(
+                    "shape_slat_guidance_strength",
+                    default=7.5,
+                    min=0.0,
+                    max=30.0,
+                    step=0.1,
                 ),
-                "ss_guidance_rescale": (
-                    "FLOAT",
-                    {"default": 0.7, "min": 0.0, "max": 1.0, "step": 0.05},
+                io.Float.Input(
+                    "shape_slat_guidance_rescale",
+                    default=0.5,
+                    min=0.0,
+                    max=1.0,
+                    step=0.05,
                 ),
-                "ss_sampling_steps": (
-                    "INT",
-                    {"default": 12, "min": 1, "max": 100},
+                io.Int.Input("shape_slat_sampling_steps", default=12, min=1, max=100),
+                io.Float.Input("shape_slat_rescale_t", default=3.0, min=0.0, max=20.0, step=0.1),
+                io.Float.Input(
+                    "tex_slat_guidance_strength",
+                    default=1.0,
+                    min=0.0,
+                    max=30.0,
+                    step=0.1,
                 ),
-                "ss_rescale_t": (
-                    "FLOAT",
-                    {"default": 5.0, "min": 0.0, "max": 20.0, "step": 0.1},
+                io.Float.Input(
+                    "tex_slat_guidance_rescale",
+                    default=0.0,
+                    min=0.0,
+                    max=1.0,
+                    step=0.05,
                 ),
-                "shape_slat_guidance_strength": (
-                    "FLOAT",
-                    {"default": 7.5, "min": 0.0, "max": 30.0, "step": 0.1},
-                ),
-                "shape_slat_guidance_rescale": (
-                    "FLOAT",
-                    {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05},
-                ),
-                "shape_slat_sampling_steps": (
-                    "INT",
-                    {"default": 12, "min": 1, "max": 100},
-                ),
-                "shape_slat_rescale_t": (
-                    "FLOAT",
-                    {"default": 3.0, "min": 0.0, "max": 20.0, "step": 0.1},
-                ),
-                "tex_slat_guidance_strength": (
-                    "FLOAT",
-                    {"default": 1.0, "min": 0.0, "max": 30.0, "step": 0.1},
-                ),
-                "tex_slat_guidance_rescale": (
-                    "FLOAT",
-                    {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05},
-                ),
-                "tex_slat_sampling_steps": (
-                    "INT",
-                    {"default": 12, "min": 1, "max": 100},
-                ),
-                "tex_slat_rescale_t": (
-                    "FLOAT",
-                    {"default": 3.0, "min": 0.0, "max": 20.0, "step": 0.1},
-                ),
-            }
-        }
+                io.Int.Input("tex_slat_sampling_steps", default=12, min=1, max=100),
+                io.Float.Input("tex_slat_rescale_t", default=3.0, min=0.0, max=20.0, step=0.1),
+            ],
+            outputs=[PIXAL3D_SAMPLER_SETTINGS.Output("sampler_settings")],
+            is_output_node=False,
+        )
 
-    RETURN_TYPES = ("PIXAL3D_SAMPLER_SETTINGS",)
-    RETURN_NAMES = ("sampler_settings",)
-    FUNCTION = "settings"
-    CATEGORY = "Pixal3D"
-
-    def settings(
-        self,
+    @classmethod
+    def execute(
+        cls,
         ss_guidance_strength: float,
         ss_guidance_rescale: float,
         ss_sampling_steps: int,
@@ -243,8 +225,8 @@ class Pixal3DSamplerSettings:
         tex_slat_guidance_rescale: float,
         tex_slat_sampling_steps: int,
         tex_slat_rescale_t: float,
-    ):
-        return (
+    ) -> io.NodeOutput:
+        return io.NodeOutput(
             make_sampler_settings(
                 ss_guidance_strength,
                 ss_guidance_rescale,
@@ -258,94 +240,85 @@ class Pixal3DSamplerSettings:
                 tex_slat_guidance_rescale,
                 tex_slat_sampling_steps,
                 tex_slat_rescale_t,
-            ),
+            )
         )
 
 
-class Pixal3DPreprocessImage:
+class Pixal3DPreprocessImage(io.ComfyNode):
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "rembg_model": ("PIXAL3D_REMBG_MODEL", {"forceInput": True}),
-                "image": ("IMAGE", {}),
-                "batch_index": ("INT", {"default": 0, "min": 0, "max": 4096}),
-                "background_color": ("STRING", {"default": "#000000"}),
-            }
-        }
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="Pixal3DPreprocessImage",
+            display_name="Pixal3D Preprocess Image",
+            category="Pixal3D",
+            description="Run Pixal3D background removal and crop preprocessing on a ComfyUI image.",
+            inputs=[
+                PIXAL3D_REMBG_MODEL.Input("rembg_model"),
+                io.Image.Input("image"),
+                io.Int.Input("batch_index", default=0, min=0, max=4096),
+                io.String.Input("background_color", default="#000000"),
+            ],
+            outputs=[io.Image.Output("preprocessed_image")],
+            is_output_node=False,
+        )
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("preprocessed_image",)
-    FUNCTION = "preprocess"
-    CATEGORY = "Pixal3D"
-
-    def preprocess(
-        self,
+    @classmethod
+    def execute(
+        cls,
         rembg_model: Any,
         image: torch.Tensor,
         batch_index: int,
         background_color: str,
-    ):
+    ) -> io.NodeOutput:
         pil_image = image_tensor_to_pil(image, batch_index)
         preprocessed = preprocess_image_with_background_remover(
             rembg_model,
             pil_image,
             background_color=background_color,
         )
-        return (pil_to_image_tensor(preprocessed),)
+        return io.NodeOutput(pil_to_image_tensor(preprocessed))
 
 
-class Pixal3DImageTo3D:
+class Pixal3DImageTo3D(io.ComfyNode):
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "pixal3d_model": ("PIXAL3D_MODEL", {"forceInput": True}),
-                "image": ("IMAGE", {}),
-                "seed": (
-                    "INT",
-                    {"default": 42, "min": 0, "max": int(MAX_SEED)},
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="Pixal3DImageTo3D",
+            display_name="Pixal3D Image to 3D",
+            category="Pixal3D",
+            description="Generate an in-memory GLB and camera metadata JSON from one ComfyUI image.",
+            inputs=[
+                PIXAL3D_MODEL.Input("pixal3d_model"),
+                io.Image.Input("image"),
+                io.Int.Input("seed", default=42, min=0, max=int(MAX_SEED)),
+                io.Combo.Input(
+                    "pipeline_type",
+                    options=["1024_cascade", "1536_cascade"],
+                    default="1024_cascade",
                 ),
-                "pipeline_type": (["1024_cascade", "1536_cascade"],),
-                "batch_index": ("INT", {"default": 0, "min": 0, "max": 4096}),
-                "mesh_scale": (
-                    "FLOAT",
-                    {"default": 1.0, "min": 0.01, "max": 10.0, "step": 0.01},
-                ),
-                "extend_pixel": ("INT", {"default": 0, "min": -256, "max": 256}),
-                "image_resolution": ("INT", {"default": 512, "min": 128, "max": 2048}),
-                "max_num_tokens": (
-                    "INT",
-                    {"default": 49152, "min": 1024, "max": 262144},
-                ),
-                "decimation_target": (
-                    "INT",
-                    {"default": 200000, "min": 1000, "max": 2000000},
-                ),
-                "texture_size": (
-                    "INT",
-                    {"default": 2048, "min": 256, "max": 8192},
-                ),
-                "remesh": ("BOOLEAN", {"default": True}),
-                "remesh_band": ("INT", {"default": 1, "min": 0, "max": 8}),
-                "remesh_project": ("INT", {"default": 0, "min": 0, "max": 8}),
-                "extension_webp": ("BOOLEAN", {"default": True}),
-            },
-            "optional": {
-                "sampler_settings": (
-                    "PIXAL3D_SAMPLER_SETTINGS",
-                    {"forceInput": True},
-                ),
-            },
-        }
+                io.Int.Input("batch_index", default=0, min=0, max=4096),
+                io.Float.Input("mesh_scale", default=1.0, min=0.01, max=10.0, step=0.01),
+                io.Int.Input("extend_pixel", default=0, min=-256, max=256),
+                io.Int.Input("image_resolution", default=512, min=128, max=2048),
+                io.Int.Input("max_num_tokens", default=49152, min=1024, max=262144),
+                io.Int.Input("decimation_target", default=200000, min=1000, max=2000000),
+                io.Int.Input("texture_size", default=2048, min=256, max=8192),
+                io.Boolean.Input("remesh", default=True),
+                io.Int.Input("remesh_band", default=1, min=0, max=8),
+                io.Int.Input("remesh_project", default=0, min=0, max=8),
+                io.Boolean.Input("extension_webp", default=True),
+                PIXAL3D_SAMPLER_SETTINGS.Input("sampler_settings", optional=True),
+            ],
+            outputs=[
+                io.File3DGLB.Output("model_3d"),
+                io.String.Output("camera_json"),
+            ],
+            is_output_node=False,
+        )
 
-    RETURN_TYPES = ("FILE_3D_GLB", "STRING")
-    RETURN_NAMES = ("model_3d", "camera_json")
-    FUNCTION = "generate"
-    CATEGORY = "Pixal3D"
-
-    def generate(
-        self,
+    @classmethod
+    def execute(
+        cls,
         pixal3d_model: Any,
         image: torch.Tensor,
         seed: int,
@@ -362,7 +335,7 @@ class Pixal3DImageTo3D:
         remesh_project: int,
         extension_webp: bool,
         sampler_settings: Optional[Dict[str, Dict[str, float]]] = None,
-    ):
+    ) -> io.NodeOutput:
         pil_image = image_tensor_to_pil(image, batch_index)
         settings = sampler_settings or default_sampler_settings()
 
@@ -385,21 +358,30 @@ class Pixal3DImageTo3D:
             progress_callback=_progress_callback(),
         )
         camera_json = camera_params_to_json(result.camera_params, result.resolution)
-        return (_glb_file_output(result.glb_data), camera_json)
+        return io.NodeOutput(_glb_file_output(result.glb_data), camera_json)
 
 
-NODE_CLASS_MAPPINGS = {
-    "Pixal3DModelLoader": Pixal3DModelLoader,
-    "Pixal3DBackgroundRemoverLoader": Pixal3DBackgroundRemoverLoader,
-    "Pixal3DSamplerSettings": Pixal3DSamplerSettings,
-    "Pixal3DPreprocessImage": Pixal3DPreprocessImage,
-    "Pixal3DImageTo3D": Pixal3DImageTo3D,
-}
+class Pixal3DExtension(ComfyExtension):
+    async def get_node_list(self) -> list[type[io.ComfyNode]]:
+        return [
+            Pixal3DModelLoader,
+            Pixal3DBackgroundRemoverLoader,
+            Pixal3DSamplerSettings,
+            Pixal3DPreprocessImage,
+            Pixal3DImageTo3D,
+        ]
 
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "Pixal3DModelLoader": "Pixal3D Model Loader",
-    "Pixal3DBackgroundRemoverLoader": "Pixal3D Background Remover Loader",
-    "Pixal3DSamplerSettings": "Pixal3D Sampler Settings",
-    "Pixal3DPreprocessImage": "Pixal3D Preprocess Image",
-    "Pixal3DImageTo3D": "Pixal3D Image to 3D",
-}
+
+async def comfy_entrypoint() -> Pixal3DExtension:
+    return Pixal3DExtension()
+
+
+__all__ = [
+    "Pixal3DModelLoader",
+    "Pixal3DBackgroundRemoverLoader",
+    "Pixal3DSamplerSettings",
+    "Pixal3DPreprocessImage",
+    "Pixal3DImageTo3D",
+    "Pixal3DExtension",
+    "comfy_entrypoint",
+]

@@ -20,30 +20,6 @@ from ....utils import dist_utils
 from ....utils.dist_utils import read_file_dist
 
 
-def _get_dinov3_layers(model: nn.Module) -> nn.ModuleList:
-    """Return DINOv3 transformer blocks for transformers v4 and v5 layouts."""
-    if hasattr(model, "layer"):
-        return model.layer
-    encoder = getattr(model, "model", None)
-    if encoder is not None and hasattr(encoder, "layer"):
-        return encoder.layer
-    raise AttributeError(
-        f"{model.__class__.__name__} does not expose DINOv3 layers as "
-        "'layer' or 'model.layer'."
-    )
-
-
-def _unwrap_hidden_states(output: Any) -> torch.Tensor:
-    if isinstance(output, torch.Tensor):
-        return output
-    if isinstance(output, tuple):
-        return output[0]
-    last_hidden_state = getattr(output, "last_hidden_state", None)
-    if last_hidden_state is not None:
-        return last_hidden_state
-    raise TypeError(f"Unexpected DINOv3 layer output type: {type(output).__name__}")
-
-
 # =============================================================================
 # Projection Utilities
 # =============================================================================
@@ -91,7 +67,7 @@ def project_points_to_image_batch(
     points_homogeneous = torch.cat([points_3d_batch, ones], dim=-1)  # [B, N, 4]
     
     # Compute world to camera transformation matrix
-    world_to_camera = torch.linalg.inv(transform_matrix)  # [B, 4, 4]
+    world_to_camera = torch.linalg.inv(transform_matrix.float()).to(transform_matrix.dtype)  # linalg.inv requires fp32+
     
     # Batch transform to camera coordinate system: [B, N, 4] @ [B, 4, 4]^T -> [B, N, 3]
     points_camera = torch.bmm(points_homogeneous, world_to_camera.transpose(-2, -1))[..., :3]  # [B, N, 3]
@@ -477,11 +453,11 @@ class DinoV3ProjFeatureExtractor(nn.Module):
         hidden_states = self.model.embeddings(image, bool_masked_pos=None)
         position_embeddings = self.model.rope_embeddings(image)
 
-        for layer_module in _get_dinov3_layers(self.model):
-            hidden_states = _unwrap_hidden_states(layer_module(
+        for layer_module in self.model.layer:
+            hidden_states = layer_module(
                 hidden_states,
                 position_embeddings=position_embeddings,
-            ))
+            )
 
         return F.layer_norm(hidden_states, hidden_states.shape[-1:])
     
@@ -737,11 +713,11 @@ class DinoV3VaeProjFeatureExtractor(nn.Module):
         image = image.to(self.dino_model.embeddings.patch_embeddings.weight.dtype)
         hidden_states = self.dino_model.embeddings(image, bool_masked_pos=None)
         position_embeddings = self.dino_model.rope_embeddings(image)
-        for layer_module in _get_dinov3_layers(self.dino_model):
-            hidden_states = _unwrap_hidden_states(layer_module(
+        for layer_module in self.dino_model.layer:
+            hidden_states = layer_module(
                 hidden_states,
                 position_embeddings=position_embeddings,
-            ))
+            )
         return F.layer_norm(hidden_states, hidden_states.shape[-1:])
     
     @torch.no_grad()

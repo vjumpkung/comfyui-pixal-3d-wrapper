@@ -9,25 +9,7 @@ from PIL import Image
 
 os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-attention_backend = (
-    os.environ.get("PIXAL3D_ATTENTION_BACKEND")
-    or os.environ.get("ATTN_BACKEND")
-    or "flash_attn_3"
-)
-os.environ["ATTN_BACKEND"] = attention_backend
-sparse_attention_backend = (
-    os.environ.get("PIXAL3D_SPARSE_ATTENTION_BACKEND")
-    or os.environ.get("SPARSE_ATTN_BACKEND")
-)
-if sparse_attention_backend is None and attention_backend in {
-    "xformers",
-    "flash_attn",
-    "flash_attn_3",
-    "flash_attn_4",
-}:
-    sparse_attention_backend = attention_backend
-if sparse_attention_backend is not None:
-    os.environ["SPARSE_ATTN_BACKEND"] = sparse_attention_backend
+os.environ.setdefault("ATTN_BACKEND", "flash_attn")
 os.environ["FLEX_GEMM_AUTOTUNE_CACHE_PATH"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'autotune_cache.json')
 os.environ["FLEX_GEMM_AUTOTUNER_VERBOSE"] = '1'
 
@@ -83,12 +65,13 @@ def build_image_cond_model(config: dict):
 
 def load_moge_model(device="cuda", model_name=MOGE_MODEL_NAME):
     from moge.model.v2 import MoGeModel
-    moge_model = MoGeModel.from_pretrained(model_name).to(device)
+    moge_model = MoGeModel.from_pretrained(model_name)
+    moge_model = moge_model.to(device)
     moge_model.eval()
     return moge_model
 
 
-def init_pipeline(model_path=MODEL_PATH, device="cuda"):
+def init_pipeline(model_path=MODEL_PATH, device="cuda", low_vram=False):
     print(f"[Pipeline] Loading from {model_path}...")
     pipeline = Pixal3DImageTo3DPipeline.from_pretrained(model_path)
 
@@ -98,19 +81,33 @@ def init_pipeline(model_path=MODEL_PATH, device="cuda"):
     pipeline.image_cond_model_shape_1024 = build_image_cond_model(IMAGE_COND_CONFIGS["shape_1024"])
     pipeline.image_cond_model_tex_1024 = build_image_cond_model(IMAGE_COND_CONFIGS["tex_1024"])
 
-    pipeline.low_vram = False
-    pipeline.cuda()
-
-    pipeline.image_cond_model_ss.cuda()
-    pipeline.image_cond_model_shape_512.cuda()
-    pipeline.image_cond_model_shape_1024.cuda()
-    pipeline.image_cond_model_tex_1024.cuda()
-
-    print("[NAF] Pre-loading NAF upsampler model...")
-    for attr in ['image_cond_model_ss', 'image_cond_model_shape_512', 'image_cond_model_shape_1024', 'image_cond_model_tex_1024']:
-        model = getattr(pipeline, attr, None)
-        if model is not None and getattr(model, 'use_naf_upsample', False):
-            model._load_naf()
+    if low_vram:
+        # Low-VRAM mode: models stay on CPU, loaded to GPU on-demand per stage.
+        # Peak VRAM = one flow model + one DinoV3, not all ~18 GB at once.
+        print("[NAF] Pre-downloading NAF upsampler weights (CPU only)...")
+        for attr in ['image_cond_model_ss', 'image_cond_model_shape_512',
+                     'image_cond_model_shape_1024', 'image_cond_model_tex_1024']:
+            m = getattr(pipeline, attr, None)
+            if m is not None and getattr(m, 'use_naf_upsample', False):
+                m._load_naf()
+        pipeline._device = torch.device(device)
+        pipeline.low_vram = True
+        print("[Pipeline] Low-VRAM mode enabled.")
+    else:
+        # Standard mode: all models loaded to GPU at once (faster, needs more VRAM).
+        pipeline.low_vram = False
+        pipeline.cuda()
+        pipeline.image_cond_model_ss.cuda()
+        pipeline.image_cond_model_shape_512.cuda()
+        pipeline.image_cond_model_shape_1024.cuda()
+        pipeline.image_cond_model_tex_1024.cuda()
+        print("[NAF] Pre-loading NAF upsampler model...")
+        for attr in ['image_cond_model_ss', 'image_cond_model_shape_512',
+                     'image_cond_model_shape_1024', 'image_cond_model_tex_1024']:
+            m = getattr(pipeline, attr, None)
+            if m is not None and getattr(m, 'use_naf_upsample', False):
+                m._load_naf()
+        print("[Pipeline] Standard mode (all models on GPU).")
 
     return pipeline
 
@@ -182,14 +179,15 @@ def run_inference(
     image_resolution: int = 512,
     max_num_tokens: int = 49152,
     model_path: str = MODEL_PATH,
+    manual_fov: float = -1.0,
+    low_vram: bool = False,
+    resolution: int = -1,
 ):
     # Load models
-    pipeline = init_pipeline(model_path)
+    pipeline = init_pipeline(model_path, low_vram=low_vram)
 
-    print("[MoGe-2] Loading model for camera estimation...")
-    moge_model = load_moge_model(device="cuda")
-
-    # Preprocess image
+    # Preprocess image first — rembg loads to GPU for this call, then offloads.
+    # MoGe is loaded afterwards so both never occupy VRAM at the same time.
     print(f"[Inference] Processing image: {image_path}")
     img = Image.open(image_path)
     image_preprocessed = pipeline.preprocess_image(img)
@@ -199,14 +197,32 @@ def run_inference(
     image_preprocessed.save(tmp_path)
 
     # Camera estimation
-    print("[Inference] Estimating camera parameters...")
-    camera_params = get_camera_params_wild_moge(
-        tmp_path, moge_model, device="cuda",
-        mesh_scale=mesh_scale, extend_pixel=extend_pixel,
-        image_resolution=image_resolution,
-    )
+    if manual_fov > 0:
+        # Use manually specified FOV (in radians)
+        camera_angle_x = float(manual_fov)
+        grid_point = torch.tensor([-1.0, 0.0, 0.0])
+        distance = distance_from_fov(
+            camera_angle_x, grid_point,
+            torch.tensor([0 - extend_pixel, image_resolution - 1 + extend_pixel]),
+            mesh_scale, image_resolution
+        )["distance_from_x"]
+        camera_params = {'camera_angle_x': camera_angle_x, 'distance': distance, 'mesh_scale': mesh_scale}
+        print(f"[Inference] Using manual FOV: {math.degrees(manual_fov):.2f}° ({manual_fov:.4f} rad), distance={distance:.4f}")
+    else:
+        print("[MoGe-2] Loading model for camera estimation...")
+        moge_model = load_moge_model(device="cuda")
+        print("[Inference] Estimating camera parameters...")
+        camera_params = get_camera_params_wild_moge(
+            tmp_path, moge_model, device="cuda",
+            mesh_scale=mesh_scale, extend_pixel=extend_pixel,
+            image_resolution=image_resolution,
+        )
+        print(f"  camera_angle_x={camera_params['camera_angle_x']:.4f}, distance={camera_params['distance']:.4f}")
+        # MoGe is only needed for camera estimation; free its VRAM for inference.
+        moge_model.cpu()
+        del moge_model
+        torch.cuda.empty_cache()
     os.remove(tmp_path)
-    print(f"  camera_angle_x={camera_params['camera_angle_x']:.4f}, distance={camera_params['distance']:.4f}")
 
     # Run pipeline
     print("[Inference] Running 3D generation pipeline...")
@@ -225,7 +241,8 @@ def run_inference(
         "guidance_rescale": tex_slat_guidance_rescale, "rescale_t": tex_slat_rescale_t,
     }
 
-    pipeline_type = "1024_cascade"
+    pipeline_type = f"{resolution if resolution > 0 else (1024 if low_vram else 1536)}_cascade"
+    print(f"[Inference] Using pipeline_type={pipeline_type}")
     mesh_list, (shape_slat, tex_slat, res) = pipeline.run(
         image_preprocessed,
         camera_params=camera_params,
@@ -247,7 +264,7 @@ def run_inference(
         vertices=mesh.vertices, faces=mesh.faces, attr_volume=mesh.attrs,
         coords=mesh.coords, attr_layout=pipeline.pbr_attr_layout,
         grid_size=res, aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-        decimation_target=200000, texture_size=2048,
+        decimation_target=1000000, texture_size=4096,
         remesh=True, remesh_band=1, remesh_project=0, use_tqdm=True,
     )
 
@@ -271,7 +288,16 @@ if __name__ == "__main__":
     parser.add_argument("--image", type=str, required=True, help="Path to input image")
     parser.add_argument("--output", type=str, default="./output.glb", help="Output GLB file path")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--fov", type=float, default=-1.0,
+                        help="Manual camera FOV in radians (e.g. 0.2). "
+                             "If not set, FOV is auto-estimated via MoGe-2. "
+                             "Try 0.2 rad if you notice distortion.")
     parser.add_argument("--model_path", type=str, default=MODEL_PATH, help="Model path or HuggingFace repo")
+    parser.add_argument("--low_vram", action="store_true",
+                        help="Enable low-VRAM mode: models stay on CPU and are loaded to GPU on-demand per stage. "
+                             "Reduces peak VRAM from ~18GB to ~10-12GB at the cost of slower inference.")
+    parser.add_argument("--resolution", type=int, default=-1,
+                        help="Pipeline resolution (1024 or 1536). Default: 1024 if --low_vram, else 1536.")
 
     args = parser.parse_args()
 
@@ -279,5 +305,8 @@ if __name__ == "__main__":
         image_path=args.image,
         output_path=args.output,
         seed=args.seed,
+        manual_fov=args.fov,
         model_path=args.model_path,
+        low_vram=args.low_vram,
+        resolution=args.resolution,
     )

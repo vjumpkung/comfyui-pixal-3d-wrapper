@@ -21,8 +21,8 @@ DEFAULT_MODEL_PATH = "TencentARC/Pixal3D"
 DEFAULT_MOGE_MODEL = "Ruicheng/moge-2-vitl"
 DEFAULT_REMBG_MODEL = "ZhengPeng7/BiRefNet"
 MAX_SEED = np.iinfo(np.int32).max
-DEFAULT_ATTENTION_BACKEND = "flash_attn_3"
-DEFAULT_SPARSE_ATTENTION_BACKEND = "flash_attn"
+DEFAULT_ATTENTION_BACKEND = "sdpa"
+DEFAULT_SPARSE_ATTENTION_BACKEND = "sdpa"
 PIXAL3D_ATTENTION_BACKENDS = (
     "flash_attn_3",
     "flash_attn",
@@ -35,6 +35,7 @@ PIXAL3D_SPARSE_ATTENTION_BACKENDS = (
     "auto",
     "flash_attn_3",
     "flash_attn",
+    "sdpa",
     "xformers",
     "flash_attn_4",
 )
@@ -122,16 +123,21 @@ _NAF_MODEL_CACHE: Dict[Tuple[str, str], Any] = {}
 _NAF_MODEL_CACHE_LOCK = threading.Lock()
 
 
-def _env_flag(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _profile_load_enabled() -> bool:
-    return _env_flag("PIXAL3D_PROFILE_LOAD")
+    return _env_flag("PIXAL3D_PROFILE_LOAD", default=True)
 
 
 def _load_progress_enabled() -> bool:
-    return _env_flag("PIXAL3D_LOAD_PROGRESS") or _profile_load_enabled()
+    if "PIXAL3D_LOAD_PROGRESS" in os.environ:
+        return _env_flag("PIXAL3D_LOAD_PROGRESS")
+    return _profile_load_enabled()
 
 
 def _sync_cuda_for_timing(device: Optional[str]) -> None:
@@ -511,14 +517,44 @@ def _resolve_moge_model_path(model_name: str) -> str:
     return _resolve_hf_file(model_name, "model.pt")
 
 
-def resolve_pixal3d_root(pixal3d_root: Optional[str] = None) -> str:
-    configured_root = pixal3d_root or os.environ.get("PIXAL3D_ROOT") or BUNDLED_PIXAL3D_ROOT
-    return os.path.abspath(os.path.expanduser(str(configured_root).strip()))
+def resolve_pixal3d_root() -> str:
+    return os.path.abspath(str(BUNDLED_PIXAL3D_ROOT))
 
 
-def configure_pixal3d_source_path(pixal3d_root: str) -> None:
-    if pixal3d_root not in sys.path:
-        sys.path.insert(0, pixal3d_root)
+def _path_is_within(path: str, root: str) -> bool:
+    try:
+        Path(path).resolve().relative_to(Path(root).resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def _ensure_bundled_pixal3d_module(root: str) -> None:
+    module = sys.modules.get("pixal3d")
+    if module is None:
+        return
+
+    module_file = getattr(module, "__file__", None)
+    if module_file and _path_is_within(module_file, root):
+        return
+
+    raise RuntimeError(
+        "A non-bundled pixal3d package is already imported. Restart ComfyUI so "
+        f"this wrapper can load the bundled Pixal3D source from: {root}"
+    )
+
+
+def configure_pixal3d_source_path() -> str:
+    pixal3d_root = resolve_pixal3d_root()
+    normalized_root = os.path.normcase(os.path.abspath(pixal3d_root))
+    sys.path[:] = [
+        entry
+        for entry in sys.path
+        if os.path.normcase(os.path.abspath(entry or os.curdir)) != normalized_root
+    ]
+    sys.path.insert(0, pixal3d_root)
+    _ensure_bundled_pixal3d_module(pixal3d_root)
+    return pixal3d_root
 
 
 def normalize_attention_backend(value: Optional[str]) -> str:
@@ -577,10 +613,10 @@ def apply_pixal3d_attention_backends(
 
 
 def configure_pixal3d_environment(
-    pixal3d_root: str,
     attention_backend: str,
     sparse_attention_backend: str,
 ) -> None:
+    pixal3d_root = configure_pixal3d_source_path()
     os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     apply_pixal3d_attention_backends(attention_backend, sparse_attention_backend)
@@ -588,7 +624,6 @@ def configure_pixal3d_environment(
         pixal3d_root, "autotune_cache.json"
     )
     os.environ.setdefault("FLEX_GEMM_AUTOTUNER_VERBOSE", "1")
-    configure_pixal3d_source_path(pixal3d_root)
 
 
 def require_cuda_device(device: str) -> None:
@@ -1068,13 +1103,12 @@ def _load_pipeline_without_background_remover(pipeline_cls: Any, model_path: str
 
 
 def load_pixal3d_background_remover_context(
-    pixal3d_root: Optional[str] = None,
     model_name: str = DEFAULT_REMBG_MODEL,
     device: str = "cuda",
     low_vram: bool = False,
     force_reload: bool = False,
 ) -> Pixal3DBackgroundRemoverContext:
-    root = resolve_pixal3d_root(pixal3d_root)
+    root = resolve_pixal3d_root()
     package_init = os.path.join(root, "pixal3d", "__init__.py")
     if not os.path.isdir(root) or not os.path.isfile(package_init):
         raise RuntimeError(
@@ -1095,7 +1129,7 @@ def load_pixal3d_background_remover_context(
                 print("[Pixal3D] load: background remover cache hit")
             return _REMBG_CACHE[key]
 
-        configure_pixal3d_source_path(root)
+        configure_pixal3d_source_path()
         _patch_rembg_cache_resolution()
 
         from pixal3d.pipelines import rembg
@@ -1223,7 +1257,6 @@ def _preload_naf_models(
 
 
 def load_pixal3d_context(
-    pixal3d_root: Optional[str] = None,
     model_path: str = DEFAULT_MODEL_PATH,
     moge_model_name: str = DEFAULT_MOGE_MODEL,
     device: str = "cuda",
@@ -1234,7 +1267,7 @@ def load_pixal3d_context(
     naf_attention_backend: str = "auto",
     force_reload: bool = False,
 ) -> Pixal3DContext:
-    root = resolve_pixal3d_root(pixal3d_root)
+    root = resolve_pixal3d_root()
     package_init = os.path.join(root, "pixal3d", "__init__.py")
     if not os.path.isdir(root) or not os.path.isfile(package_init):
         raise RuntimeError(
@@ -1276,7 +1309,7 @@ def load_pixal3d_context(
                 print("[Pixal3D] load: Pixal3D context cache hit")
             return context
 
-        configure_pixal3d_environment(root, attention_backend, sparse_attention_backend)
+        configure_pixal3d_environment(attention_backend, sparse_attention_backend)
 
         try:
             from moge.model.v2 import MoGeModel

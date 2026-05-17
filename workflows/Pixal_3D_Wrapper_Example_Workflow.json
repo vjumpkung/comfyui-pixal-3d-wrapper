@@ -308,8 +308,8 @@
         "cuda",
         true,
         true,
-        "flash_attn",
-        "flash_attn",
+        "sdpa",
+        "auto",
         "torch",
         false
       ]

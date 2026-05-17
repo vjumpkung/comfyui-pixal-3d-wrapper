@@ -52,14 +52,14 @@ stack installed in the same Python environment that runs ComfyUI.
   - `device`: `cuda`
   - `low_vram`: `False`
   - `preload_naf`: `True`
-  - `attention_backend`: `flash_attn_3`
+  - `attention_backend`: `sdpa`
   - `sparse_attention_backend`: `auto`
   - `naf_attention_backend`: `auto`
 - `Pixal3D Background Remover Loader` also defaults `low_vram` to `False`, so
   the background remover stays CUDA-resident unless the user explicitly enables
   CPU offload.
-- To test an external Pixal3D checkout, set `PIXAL3D_ROOT` before starting
-  ComfyUI. Do not re-add a normal loader widget for this unless the user asks.
+- Pixal3D imports are hardcoded to the bundled `vendor/Pixal3D` source. Do not
+  add `PIXAL3D_ROOT`, `pixal3d_root`, or other runtime source-switching paths.
 - Hugging Face repo IDs should be resolved to local snapshots before upstream
   `from_pretrained` calls. Check the local cache first, including symlinked
   snapshot files; download only on cache miss or incomplete snapshot.
@@ -75,12 +75,13 @@ stack installed in the same Python environment that runs ComfyUI.
   conditioning models, MoGe, and background remover on CUDA after load.
   `low_vram=True` is the conservative path and moves models to CUDA only when
   needed, then back to CPU.
-- Set `PIXAL3D_PROFILE_LOAD=1` to print cache hits and load timings for Hugging
+- Load debugging is shown by default: cache hits and load timings for Hugging
   Face snapshot resolution, Pixal3D checkpoint load, shared DINO load/cache
   hits, per-conditioning wrapper construction, shared NAF load/cache hits, CUDA
   moves, NAF preload, MoGe load, and background remover load.
-- Set `PIXAL3D_LOAD_PROGRESS=1` to show a tqdm stage progress bar for Pixal3D
-  model loading. `PIXAL3D_PROFILE_LOAD=1` also enables this progress bar.
+- The tqdm stage progress bar for Pixal3D model loading is also shown by
+  default. Set `PIXAL3D_PROFILE_LOAD=0` and `PIXAL3D_LOAD_PROGRESS=0` before
+  starting ComfyUI to silence the timing logs and progress bar.
 - The wrapper-side BiRefNet patch must keep background-remover inputs on the
   loaded model's device and floating dtype. This avoids float32 input vs fp16
   bias failures when the Hugging Face rembg model loads half-precision weights.
@@ -89,8 +90,10 @@ stack installed in the same Python environment that runs ComfyUI.
   Background Remover Loader` and `Pixal3D Preprocess Image`.
 - Pixal3D dense attention backends are `flash_attn_3`, `flash_attn`, `sdpa`,
   `xformers`, `naive`, and `flash_attn_4`. Sparse attention backends are
-  `auto`, `flash_attn_3`, `flash_attn`, `xformers`, and `flash_attn_4`; sparse
-  attention does not support `sdpa`.
+  `auto`, `flash_attn_3`, `flash_attn`, `sdpa`, `xformers`, and
+  `flash_attn_4`; the bundled vendor source includes an `sdpa` sparse-attention
+  path so users without flash-attention can run with dense `sdpa` and sparse
+  `auto`.
 - NAF attention backends are `auto`, `torch`, `flex-fna`, `cutlass-fna`,
   `hopper-fna`, and `blackwell-fna`. On Windows, NATTEN often lacks libnatten,
   so `auto` may need the wrapper-side `torch` fallback for NAF's mismatched QK/V
@@ -104,17 +107,15 @@ stack installed in the same Python environment that runs ComfyUI.
 
 ## Development Rules
 
-- Follow ComfyUI backend conventions:
-  - class-based nodes
-  - `INPUT_TYPES`
-  - `RETURN_TYPES`
-  - `RETURN_NAMES`
-  - `FUNCTION`
-  - `CATEGORY`
-  - `NODE_CLASS_MAPPINGS`
-  - `NODE_DISPLAY_NAME_MAPPINGS`
+- Follow ComfyUI V3 backend conventions:
+  - class-based nodes inheriting `io.ComfyNode`
+  - `define_schema`
+  - `execute`
+  - `io.NodeOutput`
+  - `ComfyExtension`
+  - `comfy_entrypoint`
 - Use ComfyUI `IMAGE` tensors as `[B,H,W,C]` in float `[0,1]`.
-- Return single outputs as one-item tuples.
+- Return outputs with `io.NodeOutput`.
 - Avoid eager imports of Pixal3D, MoGe, `o_voxel`, or other heavy dependencies
   at module import time.
 - Keep vendored Pixal3D code under `vendor/Pixal3D`. Avoid editing vendored files
@@ -131,11 +132,18 @@ stack installed in the same Python environment that runs ComfyUI.
 Run lightweight checks from the repo root:
 
 ```bash
-python -m py_compile __init__.py nodes.py pixal3d_runtime.py
+python - <<'PY'
+from pathlib import Path
+
+for path in ("__init__.py", "nodes.py", "pixal3d_runtime.py"):
+    compile(Path(path).read_text(encoding="utf-8"), path, "exec")
+print("syntax ok")
+PY
 ```
 
 ```bash
-python - <<'PY'
+PYTHONPATH=../.. python - <<'PY'
+import asyncio
 import importlib.util
 import sys
 from pathlib import Path
@@ -150,12 +158,22 @@ spec = importlib.util.spec_from_file_location(
 mod = importlib.util.module_from_spec(spec)
 sys.modules[name] = mod
 spec.loader.exec_module(mod)
-print(len(mod.NODE_CLASS_MAPPINGS), sorted(mod.NODE_CLASS_MAPPINGS))
-loader_inputs = mod.NODE_CLASS_MAPPINGS["Pixal3DModelLoader"].INPUT_TYPES()["required"]
-print("pixal3d_root" in loader_inputs)
-print(loader_inputs["low_vram"][1]["default"])
-rembg_inputs = mod.NODE_CLASS_MAPPINGS["Pixal3DBackgroundRemoverLoader"].INPUT_TYPES()["required"]
-print(rembg_inputs["low_vram"][1]["default"])
+
+async def main():
+    extension = await mod.comfy_entrypoint()
+    node_list = await extension.get_node_list()
+    schemas = {node.GET_SCHEMA().node_id: node.GET_SCHEMA() for node in node_list}
+    print(len(schemas), sorted(schemas))
+    loader_inputs = {input.id: input for input in schemas["Pixal3DModelLoader"].inputs}
+    print("pixal3d_root" in loader_inputs)
+    print(loader_inputs["low_vram"].default)
+    rembg_inputs = {
+        input.id: input
+        for input in schemas["Pixal3DBackgroundRemoverLoader"].inputs
+    }
+    print(rembg_inputs["low_vram"].default)
+
+asyncio.run(main())
 PY
 ```
 
