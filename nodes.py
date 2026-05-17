@@ -58,7 +58,7 @@ class Pixal3DModelLoader(io.ComfyNode):
             node_id="Pixal3DModelLoader",
             display_name="Pixal3D Model Loader",
             category="Pixal3D",
-            description="Load and cache the bundled Pixal3D pipeline, MoGe, and DINO/NAF conditioning models.",
+            description="Load and cache the Pixal3D pipeline, MoGe, and DINO/NAF conditioning models.",
             inputs=[
                 io.String.Input(
                     "model_path",
@@ -169,10 +169,16 @@ class Pixal3DSamplerSettings(io.ComfyNode):
             category="Pixal3D",
             description="Override Pixal3D sampler parameters while keeping upstream defaults as the baseline.",
             inputs=[
-                io.Float.Input("ss_guidance_strength", default=7.5, min=0.0, max=30.0, step=0.1),
-                io.Float.Input("ss_guidance_rescale", default=0.7, min=0.0, max=1.0, step=0.05),
+                io.Float.Input(
+                    "ss_guidance_strength", default=7.5, min=0.0, max=30.0, step=0.1
+                ),
+                io.Float.Input(
+                    "ss_guidance_rescale", default=0.7, min=0.0, max=1.0, step=0.05
+                ),
                 io.Int.Input("ss_sampling_steps", default=12, min=1, max=100),
-                io.Float.Input("ss_rescale_t", default=5.0, min=0.0, max=20.0, step=0.1),
+                io.Float.Input(
+                    "ss_rescale_t", default=5.0, min=0.0, max=20.0, step=0.1
+                ),
                 io.Float.Input(
                     "shape_slat_guidance_strength",
                     default=7.5,
@@ -188,7 +194,9 @@ class Pixal3DSamplerSettings(io.ComfyNode):
                     step=0.05,
                 ),
                 io.Int.Input("shape_slat_sampling_steps", default=12, min=1, max=100),
-                io.Float.Input("shape_slat_rescale_t", default=3.0, min=0.0, max=20.0, step=0.1),
+                io.Float.Input(
+                    "shape_slat_rescale_t", default=3.0, min=0.0, max=20.0, step=0.1
+                ),
                 io.Float.Input(
                     "tex_slat_guidance_strength",
                     default=1.0,
@@ -204,7 +212,9 @@ class Pixal3DSamplerSettings(io.ComfyNode):
                     step=0.05,
                 ),
                 io.Int.Input("tex_slat_sampling_steps", default=12, min=1, max=100),
-                io.Float.Input("tex_slat_rescale_t", default=3.0, min=0.0, max=20.0, step=0.1),
+                io.Float.Input(
+                    "tex_slat_rescale_t", default=3.0, min=0.0, max=20.0, step=0.1
+                ),
             ],
             outputs=[PIXAL3D_SAMPLER_SETTINGS.Output("sampler_settings")],
             is_output_node=False,
@@ -297,11 +307,15 @@ class Pixal3DImageTo3D(io.ComfyNode):
                     default="1024_cascade",
                 ),
                 io.Int.Input("batch_index", default=0, min=0, max=4096),
-                io.Float.Input("mesh_scale", default=1.0, min=0.01, max=10.0, step=0.01),
+                io.Float.Input(
+                    "mesh_scale", default=1.0, min=0.01, max=10.0, step=0.01
+                ),
                 io.Int.Input("extend_pixel", default=0, min=-256, max=256),
                 io.Int.Input("image_resolution", default=512, min=128, max=2048),
                 io.Int.Input("max_num_tokens", default=49152, min=1024, max=262144),
-                io.Int.Input("decimation_target", default=200000, min=1000, max=2000000),
+                io.Int.Input(
+                    "decimation_target", default=200000, min=1000, max=2000000
+                ),
                 io.Int.Input("texture_size", default=2048, min=256, max=8192),
                 io.Boolean.Input("remesh", default=True),
                 io.Int.Input("remesh_band", default=1, min=0, max=8),

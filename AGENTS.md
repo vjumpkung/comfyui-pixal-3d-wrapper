@@ -5,9 +5,10 @@
 This repository is a ComfyUI custom-node wrapper for Pixal3D. It is intended to
 live under `ComfyUI/custom_nodes/comfyui-pixal-3d-wrapper`.
 
-Pixal3D inference source is bundled under `vendor/Pixal3D`, so the ComfyUI node
-does not require a separate `~/Documents/Pixal3D` checkout or a `pixal3d_root`
-loader input.
+Pixal3D inference source is not bundled. It must be importable in the Python
+environment that runs ComfyUI, or `PIXAL3D_SOURCE_PATH` must point to a local
+Pixal3D checkout containing `pixal3d/__init__.py`. The ComfyUI loader still does
+not expose a `pixal3d_root` input.
 
 Pixal3D inference requires CUDA and the upstream Pixal3D/TRELLIS.2 dependency
 stack installed in the same Python environment that runs ComfyUI.
@@ -16,13 +17,11 @@ stack installed in the same Python environment that runs ComfyUI.
 
 - `__init__.py`: exports ComfyUI node mappings.
 - `nodes.py`: defines the ComfyUI nodes and UI-facing input/output contracts.
-- `pixal3d_runtime.py`: lazy model loading, Pixal3D context cache, shared
-  DINO/NAF conditioning caches, Hugging Face cache-first model resolution, NAF
-  attention backend patching, image conversion, optional background removal
-  preprocessing, camera estimation, Pixal3D pipeline execution, and in-memory
-  GLB export.
-- `vendor/Pixal3D`: bundled upstream Pixal3D inference source, requirements,
-  and license.
+- `pixal3d_runtime.py`: stable public runtime facade used by `nodes.py`.
+- `runtime/`: focused runtime modules for constants/types, Hugging Face
+  resolution, Pixal3D source/environment setup, DINO/NAF conditioning,
+  preprocessing, model loading, image conversion, camera/sampler helpers,
+  pipeline execution, and in-memory GLB export.
 - `requirements.txt`: helper dependency list for Pixal3D-side dependencies.
 - `README.md`: user setup and workflow notes.
 
@@ -43,8 +42,8 @@ stack installed in the same Python environment that runs ComfyUI.
 
 - Keep heavyweight Pixal3D imports lazy. ComfyUI should be able to import this
   package without loading the model stack.
-- The bundled Pixal3D source root is `vendor/Pixal3D`, resolved internally
-  relative to `pixal3d_runtime.py`.
+- Pixal3D source is resolved lazily from the import environment or
+  `PIXAL3D_SOURCE_PATH`; do not import Pixal3D at package import time.
 - `Pixal3D Model Loader` intentionally does not expose `pixal3d_root`.
 - The Pixal3D model loader defaults exposed in ComfyUI are:
   - `model_path`: `TencentARC/Pixal3D`
@@ -58,8 +57,8 @@ stack installed in the same Python environment that runs ComfyUI.
 - `Pixal3D Background Remover Loader` also defaults `low_vram` to `False`, so
   the background remover stays CUDA-resident unless the user explicitly enables
   CPU offload.
-- Pixal3D imports are hardcoded to the bundled `vendor/Pixal3D` source. Do not
-  add `PIXAL3D_ROOT`, `pixal3d_root`, or other runtime source-switching paths.
+- Keep external Pixal3D source selection outside the node UI. `PIXAL3D_SOURCE_PATH`
+  is the supported source-checkout hook for non-installed Pixal3D trees.
 - Hugging Face repo IDs should be resolved to local snapshots before upstream
   `from_pretrained` calls. Check the local cache first, including symlinked
   snapshot files; download only on cache miss or incomplete snapshot.
@@ -82,7 +81,7 @@ stack installed in the same Python environment that runs ComfyUI.
 - The tqdm stage progress bar for Pixal3D model loading is also shown by
   default. Set `PIXAL3D_PROFILE_LOAD=0` and `PIXAL3D_LOAD_PROGRESS=0` before
   starting ComfyUI to silence the timing logs and progress bar.
-- The wrapper-side BiRefNet patch must keep background-remover inputs on the
+- The wrapper-owned BiRefNet loader must keep background-remover inputs on the
   loaded model's device and floating dtype. This avoids float32 input vs fp16
   bias failures when the Hugging Face rembg model loads half-precision weights.
 - `Pixal3D Image to 3D` intentionally does not call Pixal3D preprocessing.
@@ -91,9 +90,8 @@ stack installed in the same Python environment that runs ComfyUI.
 - Pixal3D dense attention backends are `flash_attn_3`, `flash_attn`, `sdpa`,
   `xformers`, `naive`, and `flash_attn_4`. Sparse attention backends are
   `auto`, `flash_attn_3`, `flash_attn`, `sdpa`, `xformers`, and
-  `flash_attn_4`; the bundled vendor source includes an `sdpa` sparse-attention
-  path so users without flash-attention can run with dense `sdpa` and sparse
-  `auto`.
+  `flash_attn_4`; `auto` follows the dense backend when supported and otherwise
+  falls back to `sdpa`.
 - NAF attention backends are `auto`, `torch`, `flex-fna`, `cutlass-fna`,
   `hopper-fna`, and `blackwell-fna`. On Windows, NATTEN often lacks libnatten,
   so `auto` may need the wrapper-side `torch` fallback for NAF's mismatched QK/V
@@ -118,12 +116,12 @@ stack installed in the same Python environment that runs ComfyUI.
 - Return outputs with `io.NodeOutput`.
 - Avoid eager imports of Pixal3D, MoGe, `o_voxel`, or other heavy dependencies
   at module import time.
-- Keep vendored Pixal3D code under `vendor/Pixal3D`. Avoid editing vendored files
-  unless a compatibility patch is needed; prefer wrapper-side changes in
-  `pixal3d_runtime.py`.
-- Existing vendored compatibility patches support DINOv3 transformer layer
-  layouts from both older and newer `transformers` versions. Preserve that
-  compatibility if touching DINOv3 feature extraction.
+- Do not reintroduce bundled Pixal3D source into this repository. Prefer
+  wrapper-side compatibility code in the focused `runtime/` modules and keep
+  `pixal3d_runtime.py` as the public re-export facade.
+- Wrapper-side DINOv3 compatibility code supports transformer layer layouts from
+  both older and newer `transformers` versions. Preserve that compatibility if
+  touching DINOv3 feature extraction.
 - Do not run full Pixal3D inference unless the active environment has CUDA and
   the Pixal3D dependency stack installed.
 

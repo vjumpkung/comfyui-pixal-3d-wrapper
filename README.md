@@ -1,8 +1,9 @@
 # ComfyUI Pixal3D Wrapper
 
-ComfyUI custom nodes for running Pixal3D image-to-3D generation. The Pixal3D
-inference source is bundled in this custom node under `vendor/Pixal3D`, so the
-loader does not require a separate `~/Documents/Pixal3D` path.
+ComfyUI custom nodes for running Pixal3D image-to-3D generation. Pixal3D
+inference source is not bundled in this custom node; install it in the same
+Python environment as ComfyUI or point `PIXAL3D_SOURCE_PATH` at a local
+Pixal3D checkout.
 
 ## Nodes
 
@@ -16,6 +17,7 @@ loader does not require a separate `~/Documents/Pixal3D` path.
 
 1. Install TRELLIS.2 and Pixal3D dependencies into the same Python environment used by ComfyUI.
 2. Install this wrapper into `ComfyUI/custom_nodes/comfyui-pixal-3d-wrapper`.
+3. If Pixal3D is a source checkout instead of an importable Python package, set `PIXAL3D_SOURCE_PATH` before starting ComfyUI.
 
 Pixal3D inference requires CUDA. The loader defaults to `device=cuda` and keeps
 models cached on CUDA after the first load. Enable `low_vram` only when you need
@@ -30,10 +32,9 @@ The loader's `attention_backend` controls Pixal3D dense attention and defaults
 to `sdpa`, which works without flash-attention installed. It can be set to
 `flash_attn_3`, `flash_attn`, `sdpa`, `xformers`, `naive`, or `flash_attn_4`.
 `sparse_attention_backend` controls Pixal3D sparse attention; its `auto` default
-follows the dense backend when sparse attention supports it, including the
-bundled Pixal3D `sdpa` sparse-attention path. If you install flash-attention or
-xformers, you can still explicitly select `flash_attn`, `flash_attn_3`,
-`flash_attn_4`, or `xformers`.
+follows the dense backend when sparse attention supports it and otherwise falls
+back to `sdpa`. If you install flash-attention or xformers, you can still
+explicitly select `flash_attn`, `flash_attn_3`, `flash_attn_4`, or `xformers`.
 
 Pixal3D also requires the upstream `utils3d` wheel:
 
@@ -41,9 +42,31 @@ Pixal3D also requires the upstream `utils3d` wheel:
 pip install utils3d
 ```
 
-The Pixal3D source path is hardcoded to this wrapper's bundled
-`vendor/Pixal3D` copy. External Pixal3D checkout switching is intentionally
-unsupported.
+Example external source setup:
+
+```powershell
+git clone https://github.com/TencentARC/Pixal3D.git
+$env:PIXAL3D_SOURCE_PATH = "D:\path\to\Pixal3D"
+python main.py
+```
+
+`PIXAL3D_SOURCE_PATH` can point either to a checkout containing
+`pixal3d/__init__.py` or directly to the `pixal3d` package directory.
+
+## Runtime Flow
+
+Runtime implementation is split under `runtime/` by responsibility.
+`pixal3d_runtime.py` remains as the public facade imported by the ComfyUI nodes.
+
+**Pixal3D Preprocess Image** converts one ComfyUI `IMAGE` frame to PIL, runs the
+wrapper-owned BiRefNet background remover when the image has no useful alpha
+channel, crops around the alpha mask, composites over `background_color`, and
+returns a ComfyUI `IMAGE`.
+
+**Pixal3D Image to 3D** converts one ComfyUI `IMAGE` frame to PIL, estimates
+camera parameters with MoGe, calls `Pixal3DImageTo3DPipeline.run` with
+`preprocess_image=False`, converts the first mesh to an in-memory GLB through
+`o_voxel.postprocess.to_glb`, and returns `FILE_3D_GLB` plus camera JSON.
 
 ## This Custom Nodes require like a TRELLIS.2 
 
@@ -76,7 +99,7 @@ Image to 3D**.
 Use **Pixal3D Sampler Settings** only when you want to override the upstream
 defaults.
 
-## Reference 
+## Reference
 
 - https://github.com/TencentARC/Pixal3D
 - https://huggingface.co/TencentARC/Pixal3D
